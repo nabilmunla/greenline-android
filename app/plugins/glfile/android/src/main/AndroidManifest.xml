@@ -1,4 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- No permissions: ACTION_OPEN_DOCUMENT grants per-URI read access to the picked document. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Package visibility (Android 11+): isDefaultPdfApp() asks PackageManager who handles
+         "VIEW application/pdf". Without this element every other PDF app is hidden from the query, the
+         answer can only be Greenline itself, and the app would wrongly report it is the default viewer.
+         Declared here, not in gen/android, because `tauri android init` rewrites that manifest. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.VIEW" />
+            <data android:mimeType="application/pdf" />
+        </intent>
+    </queries>
 </manifest>

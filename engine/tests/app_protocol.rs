@@ -84,7 +84,7 @@ fn get(host: &TestHost, path: &str, query: &str) -> Reply {
 }
 
 fn assert_cors(r: &Reply) {
-    assert_eq!(r.get("Access-Control-Allow-Origin"), Some("*"));
+    assert_eq!(r.get("Access-Control-Allow-Origin"), Some("http://tauri.localhost"));
     let exposed: Vec<&str> = r.get("Access-Control-Expose-Headers").expect("expose header").split(", ").collect();
     for h in ["X-Gl-Render-Ms", "X-Gl-W", "X-Gl-H"] {
         assert!(exposed.contains(&h), "{h} not exposed: {exposed:?}");
@@ -182,6 +182,11 @@ fn malformed_requests_get_400_without_touching_the_engine() {
         assert_cors(&r);
     }
     assert_eq!(request(&host, "GET", "/tile", None).status, 400);
+    // DS.5 / BUG-08: an origin far outside any page is refused at the boundary.
+    assert_eq!(get(&host, "/tile", "page=0&zoom=1&x0=2147482624&y0=0&w=4096&h=16&gen=1").status, 400);
+    assert_eq!(get(&host, "/tile", "page=0&zoom=1&x0=0&y0=-2147482624&w=16&h=16&gen=1").status, 400);
+    // DS.5 / BUG-20: replies are readable by the app's own page only, not by any origin.
+    assert_eq!(get(&host, "/img", "id=x").get("Access-Control-Allow-Origin"), Some("http://tauri.localhost"));
     assert_eq!(get(&host, "/img", "id=x").status, 400);
     assert_eq!(get(&host, "/img", "").status, 400);
     assert_eq!(get(&host, "/nope", "id=1").status, 404);

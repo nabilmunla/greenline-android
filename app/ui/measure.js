@@ -338,9 +338,10 @@
       await pages(plan, start.fit_width);
       if ($("walk").checked) await walk(start.pages, start.fit_width);
     } catch (e) {
-      cancelled = true;
-      // A cancel also aborts the tile fetches in flight (an AbortError, not a Stop).
+      // A cancel also aborts the tile fetches in flight (an AbortError, not a Stop). Only a cancel is
+      // reported as cancelled; any other failure ends the run as a failed step.
       if (run.cancel || (e instanceof Stop && e.code === "cancelled")) {
+        cancelled = true;
         logLine("Cancelled");
       } else {
         const c = e instanceof Stop ? e.code : codeOf(e);

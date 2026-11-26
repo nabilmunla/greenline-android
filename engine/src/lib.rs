@@ -467,7 +467,7 @@ impl DisplayList {
         let tile = new_region(&rgb, x0, y0, w, h)?;
         {
             let d = Device::from_pixmap(&tile)?;
-            let area = Rect { x0: x0 as f32, y0: y0 as f32, x1: (x0 + w as i32) as f32, y1: (y0 + h as i32) as f32 };
+            let area = Rect { x0: x0 as f32, y0: y0 as f32, x1: x0 as f32 + w as f32, y1: y0 as f32 + h as f32 };
             self.replay(&d, &Matrix::new_scale(zoom, zoom), area, cookie)?;
         }
         let render_ms = ms_since(t);
@@ -528,7 +528,10 @@ fn new_region(rgb: &Colorspace, x0: i32, y0: i32, w: u32, h: u32) -> Result<Pixm
     if w == 0 || h == 0 || w > MAX_REGION || h > MAX_REGION {
         return Err(Error::Invalid("region size out of range"));
     }
-    let mut pm = Pixmap::new_with_rect(rgb, IRect { x0, y0, x1: x0 + w as i32, y1: y0 + h as i32 }, false)?;
+    // BUG-08: an origin so large that x0 + w overflows would wrap into a huge white image.
+    let x1 = x0.checked_add(w as i32).ok_or(Error::Invalid("region origin out of range"))?;
+    let y1 = y0.checked_add(h as i32).ok_or(Error::Invalid("region origin out of range"))?;
+    let mut pm = Pixmap::new_with_rect(rgb, IRect { x0, y0, x1, y1 }, false)?;
     pm.clear_with(255)?;
     Ok(pm)
 }

@@ -141,10 +141,12 @@ fn tiny_show_page_tiles_and_errors() {
     assert!(e.send(Request::Tile { id: 9, page: 1, zoom: 1.0, x0: 0, y0: 0, gen: 0 }));
     assert_eq!(next(&e, LONG), Event::TileSkipped { id: 9, gen: 0 });
 
-    // Errors carry fixed codes.
+    // Errors carry fixed codes. (Asking for another page than the last one shown cancels first, DS.2.)
     assert!(e.send(Request::ShowPage { page: 3, fit_width: 800 }));
+    assert_eq!(next(&e, LONG), Event::Cancelled);
     assert_eq!(next(&e, LONG), Event::Error { code: ErrorCode::PageOutOfRange, tile: None });
     assert!(e.send(Request::ShowPage { page: 0, fit_width: 0 }));
+    assert_eq!(next(&e, LONG), Event::Cancelled);
     assert_eq!(next(&e, LONG), Event::Error { code: ErrorCode::InvalidRequest, tile: None });
     assert!(e.send(Request::Tile { id: 10, page: 1, zoom: 0.0, x0: 0, y0: 0, gen: 2 }));
     assert_eq!(next(&e, LONG), Event::Error { code: ErrorCode::InvalidRequest, tile: Some(10) });
@@ -367,6 +369,93 @@ fn lines_stale_tiles_are_dropped_unrendered() {
     assert!(e.events().recv_timeout(Duration::from_millis(200)).is_err());
 }
 
+
+/// DS.1 (bug sweep BUG-02): a region being drawn is stopped as soon as a newer region is queued, so the
+/// newer view does not wait for a render nobody will see. The display-list read is never stopped by this.
+#[test]
+fn lines_inflight_region_is_stopped_by_a_newer_one() {
+    let Some(path) = corpus("lines.pdf") else { return };
+    let _g = serial();
+    let e = Engine::start().expect("start");
+    open(&e, &path);
+    assert!(e.send(Request::ShowPage { page: 0, fit_width: 400 }));
+    until(&e, LONG, |ev| matches!(ev, Event::Fit { .. }));
+    let b = greenline_engine::Doc::open(&path).unwrap().page_bounds(0).unwrap();
+    let zoom = 16.0f32;
+    let (bx, by) = b.tile_origin_at(zoom, 0.3, 0.3);
+    let big = |id: u64, gen: u64| Request::Region { id, page: 0, zoom, x0: bx, y0: by, w: 4096, h: 2048, gen };
+    // Baseline: one big region alone.
+    let t = Instant::now();
+    assert!(e.send(big(1, 1)));
+    let evs = until(&e, LONG, |ev| matches!(ev, Event::Tile { .. } | Event::TileSkipped { .. } | Event::Error { .. }));
+    assert!(matches!(evs.last().unwrap().1, Event::Tile { id: 1, .. }), "baseline region: {}", short(&evs.last().unwrap().1));
+    let full = ms(t.elapsed());
+    if full < 300.0 {
+        eprintln!("SKIP: the big region took only {full:.0} ms here, too fast to tell a stop from a finish");
+        return;
+    }
+    // Same big region again, then a small newer one while the big one is being drawn.
+    assert!(e.send(big(2, 2)));
+    std::thread::sleep(Duration::from_millis((full * 0.25) as u64));
+    let (sx, sy) = b.tile_origin_at(zoom, 0.6, 0.6);
+    let tq = Instant::now();
+    assert!(e.send(Request::Region { id: 3, page: 0, zoom, x0: sx, y0: sy, w: 256, h: 256, gen: 3 }));
+    let evs = until(&e, LONG, |ev| matches!(ev, Event::Tile { id: 3, .. } | Event::Error { .. }));
+    let newer = ms(tq.elapsed());
+    let ids: Vec<String> = evs.iter().map(|(_, ev)| short(ev)).collect();
+    eprintln!("  lines.pdf: big region alone {full:.0} ms; newer small region answered {newer:.0} ms after queueing ({ids:?})");
+    assert!(evs.iter().any(|(_, ev)| matches!(ev, Event::TileSkipped { id: 2, .. })), "the older region was not stopped: {ids:?}");
+    assert!(newer < full * 0.6, "the newer region waited {newer:.0} ms (a full big render is {full:.0} ms)");
+    // A queued region older than one already sent is skipped unrendered.
+    assert!(e.send(Request::Region { id: 4, page: 0, zoom, x0: sx, y0: sy, w: 256, h: 256, gen: 2 }));
+    let evs = until(&e, LONG, |ev| matches!(ev, Event::Tile { .. } | Event::TileSkipped { .. } | Event::Error { .. }));
+    assert!(matches!(evs.last().unwrap().1, Event::TileSkipped { id: 4, .. }), "stale region: {}", short(&evs.last().unwrap().1));
+    // drop_regions: stop the region being drawn without sending a new one.
+    assert!(e.send(big(5, 10)));
+    std::thread::sleep(Duration::from_millis((full * 0.25) as u64));
+    let td = Instant::now();
+    e.client().supersede_regions(11);
+    let evs = until(&e, LONG, |ev| matches!(ev, Event::Tile { id: 5, .. } | Event::TileSkipped { id: 5, .. } | Event::Error { .. }));
+    let stop = ms(td.elapsed());
+    assert!(matches!(evs.last().unwrap().1, Event::TileSkipped { id: 5, .. }), "dropped region: {}", short(&evs.last().unwrap().1));
+    assert!(stop < full * 0.5, "the dropped region took {stop:.0} ms to stop");
+    // The list survived: nothing was re-read.
+    assert_eq!(e.stats().lists_built, 1);
+}
+
+
+/// DS.2 (bug sweep BUG-01): asking for another page stops the page being read, so the new page does
+/// not wait for all of the old one. Asking for the same page again keeps the read going.
+#[test]
+fn heavy_show_another_page_stops_the_old_read() {
+    let Some(path) = corpus("heavy.pdf") else { return };
+    let _g = serial();
+    let e = Engine::start().expect("start");
+    open(&e, &path);
+    assert!(e.send(Request::ShowPage { page: 0, fit_width: FIT_WIDTH }));
+    std::thread::sleep(Duration::from_millis(300));
+    // The same page again: no cancel, the read goes on.
+    assert!(e.send(Request::ShowPage { page: 0, fit_width: FIT_WIDTH }));
+    std::thread::sleep(Duration::from_millis(200));
+    // Another page (out of range for this one-page file, so it ends in an error): the read must stop.
+    let tq = Instant::now();
+    assert!(e.send(Request::ShowPage { page: 1, fit_width: FIT_WIDTH }));
+    let evs = until(&e, LONG, |ev| matches!(ev, Event::Error { tile: None, .. }));
+    let took = ms(tq.elapsed());
+    let names: Vec<String> = evs.iter().filter(|(_, ev)| !matches!(ev, Event::Progress { .. })).map(|(_, ev)| short(ev)).collect();
+    eprintln!("  heavy.pdf: another page asked for during the read -> answered in {took:.0} ms ({names:?})");
+    let cancelled_at = evs.iter().position(|(_, ev)| matches!(ev, Event::Cancelled));
+    assert!(cancelled_at.is_some(), "no Cancelled: the old read was not stopped ({names:?})");
+    let fit_before = evs[..cancelled_at.unwrap()].iter().any(|(_, ev)| matches!(ev, Event::Fit { .. }));
+    assert!(!fit_before, "page 1 of the old read finished first: {names:?}");
+    assert!(took < 1500.0, "the new page waited {took:.0} ms");
+    // Opening resets it: the first page shown after an open does not cancel anything.
+    open(&e, &path);
+    assert!(e.send(Request::ShowPage { page: 0, fit_width: 400 }));
+    let evs = until(&e, LONG, |ev| matches!(ev, Event::Fit { .. }));
+    assert!(!evs.iter().any(|(_, ev)| matches!(ev, Event::Cancelled)), "a cancel after open");
+}
+
 /// `LowRes` and `Fit` carry the page size in points, equal to `Doc::page_bounds`: portrait and landscape
 /// pages of the tiny PDF, through the display list and (with the list guard forced to trip) direct mode.
 #[test]
@@ -408,4 +497,52 @@ fn tiny_images_carry_page_size_in_points() {
     assert_eq!(check(&e, 1, "direct"), (842.0, 595.0));
     assert_eq!(check(&e, 1, "direct"), (842.0, 595.0));
     assert!(e.stats().direct_renders >= 3, "direct mode was used: {:?}", e.stats());
+}
+
+/// DS.5 / bug sweep BUG-08: a region origin so large that `x0 + w` overflows is refused, not drawn as a
+/// 64 MB white image (or a panic on the engine thread in a debug build).
+#[test]
+fn tiny_region_origin_overflow_is_refused() {
+    let _g = serial();
+    let e = Engine::start().expect("start");
+    open(&e, &tiny_pdf());
+    assert!(e.send(Request::Region { id: 1, page: 0, zoom: 1.0, x0: i32::MAX - 1000, y0: 0, w: 4096, h: 16, gen: 1 }));
+    let evs = until(&e, LONG, |ev| matches!(ev, Event::Tile { .. } | Event::TileSkipped { .. } | Event::Error { .. }));
+    match &evs.last().unwrap().1 {
+        Event::Error { tile: Some(1), .. } => {}
+        other => panic!("expected an Error for the overflowing origin, got {}", short(other)),
+    }
+    // The engine still works.
+    assert!(e.send(Request::Region { id: 2, page: 0, zoom: 1.0, x0: 0, y0: 0, w: 64, h: 64, gen: 2 }));
+    let evs = until(&e, LONG, |ev| matches!(ev, Event::Tile { .. } | Event::TileSkipped { .. } | Event::Error { .. }));
+    assert!(matches!(evs.last().unwrap().1, Event::Tile { id: 2, .. }), "{}", short(&evs.last().unwrap().1));
+}
+
+/// DS.5 / bug sweep BUG-11: the engine draws at anti-aliasing level 4 (the approved setting), not
+/// MuPDF's default 8: its region equals a local render at AA 4 and differs from one at AA 8.
+#[test]
+fn lines_engine_draws_at_aa_4() {
+    let Some(path) = corpus("lines.pdf") else { return };
+    let _g = serial();
+    let e = Engine::start().expect("start");
+    open(&e, &path);
+    assert!(e.send(Request::Region { id: 1, page: 0, zoom: 2.0, x0: 200, y0: 200, w: 512, h: 512, gen: 1 }));
+    let evs = until(&e, LONG, |ev| matches!(ev, Event::Tile { .. } | Event::TileSkipped { .. } | Event::Error { .. }));
+    let Event::Tile { rgba: px, w, h, .. } = &evs.last().unwrap().1 else { panic!("{}", short(&evs.last().unwrap().1)) };
+    let engine = rgba(px, *w, *h);
+    let doc = greenline_engine::Doc::open(&path).unwrap();
+    let list = doc.build_display_list(0).unwrap();
+    let local = |aa: i32| {
+        greenline_engine::set_aa_level(aa);
+        let r = list.list.render_region_cookie(2.0, 200, 200, 512, 512, None).unwrap();
+        r.image
+    };
+    let at4 = local(4);
+    let at8 = local(8);
+    greenline_engine::set_aa_level(8);
+    let (d4, _) = common::diff(&engine, &at4, 0);
+    let (d8, _) = common::diff(&engine, &at8, 0);
+    eprintln!("  lines.pdf: engine region differs from AA 4 in {d4} px, from AA 8 in {d8} px");
+    assert_eq!(d4, 0, "the engine does not draw at AA 4");
+    assert!(d8 > 0, "AA 4 and AA 8 look the same here; the test cannot tell them apart");
 }

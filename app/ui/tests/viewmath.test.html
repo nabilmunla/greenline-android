@@ -236,29 +236,21 @@
     ok(v.ox >= 0 && v.oy >= 0 && v.ox <= PT_W - VW / MAX + 1e-9 && v.oy <= PT_H - VH / MAX + 1e-9);
   });
 
-  // ---- chooseLevel ----
-  test("chooseLevel 0 when need <= fit image px/pt (boundary inclusive)", function () {
-    eq(M.chooseLevel(0.75, 2, [2, 4], 1.5), 0);       // need exactly 1.5
-    eq(M.chooseLevel(0.5, 2, [2, 4], 1.5), 0);
+  // ---- dead tile-level ladder removed (BUG-16) / maxScale comment (BUG-17) ----
+  test("no chooseLevel: the tile-level ladder is gone (viewer.js sets level 0 and uses regions)", function () {
+    eq(typeof M.chooseLevel, "undefined");
+    ok(Array.isArray(M.LEVELS) && typeof M.visibleTiles === "function", "LEVELS and visibleTiles are still used by viewer.js");
   });
-  test("chooseLevel smallest level >= need", function () {
-    eq(M.chooseLevel(0.8, 2, [2, 4], 1.5), 2);        // need 1.6
-    eq(M.chooseLevel(1.0, 2, [2, 4], 1.5), 2);        // need exactly 2 -> 2
-    eq(M.chooseLevel(1.0001, 2, [2, 4], 1.5), 4);     // need just over 2 -> 4
-    eq(M.chooseLevel(2.0, 2, [2, 4], 1.5), 4);        // need exactly 4 -> 4
+  test("maxScale doc comment says 16 device px per point, like the code", function () {
+    var x = new XMLHttpRequest();
+    x.open("GET", "../viewmath.js", false);
+    x.send();
+    var src = x.responseText;
+    var i = src.indexOf("function maxScale");
+    ok(i > 0, "maxScale found");
+    var line = src.slice(src.lastIndexOf("\n", src.lastIndexOf("\n", i) - 1) + 1, i);
+    ok(line.indexOf("16 device px per point") >= 0 && line.indexOf("4 device px") < 0, "comment: " + line.trim());
   });
-  test("chooseLevel above top level returns the largest", function () {
-    eq(M.chooseLevel(2.5, 2, [2, 4], 1.5), 4);
-  });
-  test("chooseLevel defaults: levels [2,4], no fit arg -> never 0", function () {
-    eq(M.chooseLevel(0.1, 2), 2);
-    eq(M.chooseLevel(1.5, 2, undefined, 1.0), 4);
-  });
-  test("chooseLevel respects custom levels", function () {
-    eq(M.chooseLevel(1.0, 2, [1, 2, 3, 4], 0.5), 2);
-    eq(M.chooseLevel(1.2, 2, [1, 2, 3, 4], 0.5), 3);
-  });
-
   // ---- visibleTiles ----
   test("visibleTiles at fit shows the whole page: 3x4 tiles at level 4", function () {
     var t = M.visibleTiles(fitView(), VW, VH, 4, PT_W, PT_H);

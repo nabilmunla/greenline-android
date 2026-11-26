@@ -39,6 +39,8 @@ pub struct Measure {
     run: Mutex<Option<Run>>,
     /// Labels of the runs found unfinished at this launch (recorded as `probable_kill`).
     recovered: Vec<Label>,
+    /// The launch-time recovery could not read or write the results file (BUG-24).
+    recover_failed: bool,
 }
 
 struct Run {
@@ -57,8 +59,11 @@ pub fn init(app: &AppHandle) -> std::io::Result<Measure> {
     let dir = app.path().app_data_dir().map_err(|_| std::io::Error::other("no app data dir"))?.join("measure");
     std::fs::create_dir_all(&dir)?;
     let file = ResultsFile::new(dir.join("results.jsonl"));
-    let recovered = file.recover().map(|k| k.iter().map(|r| r.label).collect()).unwrap_or_default();
-    Ok(Measure { file, run: Mutex::new(None), recovered })
+    let (recovered, recover_failed) = match file.recover() {
+        Ok(k) => (k.iter().map(|r| r.label).collect(), false),
+        Err(_) => (Vec::new(), true),
+    };
+    Ok(Measure { file, run: Mutex::new(None), recovered, recover_failed })
 }
 
 fn now_ms() -> u64 {
@@ -151,7 +156,15 @@ pub async fn measure_start(
     let start = Record { app_ver: results::version_code(env!("CARGO_PKG_VERSION")), ..Record::new(id, label, Kind::RunStart) }
         .with_device(device)
         .with_memory();
-    measure.put(&mut run, start).map_err(|c| fail(c, false))?;
+    // BUG-07: this run's peak is its own, not the process's lifetime peak.
+    greenline_engine::mem::reset_peak();
+    if let Err(c) = measure.put(&mut run, start) {
+        // BUG-09: nothing was recorded; do not leave the document (and its fd) open.
+        if opened.is_ok() {
+            host.close();
+        }
+        return Err(fail(c, false));
+    }
 
     let mut open = Record::step(id, label, Step::Open);
     match &opened {
@@ -174,7 +187,15 @@ pub async fn measure_start(
         }
     }
     let open = with_engine_state(open, &host, Some(0));
-    measure.put(&mut run, open).map_err(|c| fail(c, true))?;
+    if let Err(c) = measure.put(&mut run, open) {
+        // BUG-09: close the document and end the run, so the next launch does not record a kill.
+        if opened.is_ok() {
+            host.close();
+        }
+        let end = Record { cancelled: Some(false), ..Record::new(id, label, Kind::RunEnd) }.with_memory();
+        let _ = measure.put(&mut run, end);
+        return Err(fail(c, true));
+    }
 
     match opened {
         Ok(o) => {
@@ -272,6 +293,8 @@ pub struct StateInfo {
     next_label: u32,
     /// Labels whose run was found unfinished at this launch (recorded as `probable_kill`).
     recovered: Vec<&'static str>,
+    /// "E_RECOVER_FAILED" when the launch-time recovery failed (BUG-24), else empty.
+    recover_error: &'static str,
     records: usize,
     running: bool,
     /// The pass-mark summary: one JSON object per label (`results::Summary`: numbers, bools and fixed
@@ -304,6 +327,7 @@ pub fn measure_state(measure: State<'_, Measure>) -> Result<StateInfo, &'static 
         used,
         next_label: Label::ALL.iter().position(|l| *l == next).unwrap_or(0) as u32,
         recovered: measure.recovered.iter().map(|l| l.name()).collect(),
+        recover_error: if measure.recover_failed { "E_RECOVER_FAILED" } else { "" },
         records: records.len(),
         running: lock(&measure.run).is_some(),
         summary: format!("[{summary}]"),

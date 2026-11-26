@@ -28,8 +28,13 @@
         case "default_pdf_app":
           if (opts.defaultReject) return Promise.reject(new Error("nope"));
           return Promise.resolve({ is_default: opts.isDefault !== false });
-        case "engine_info":
-          return Promise.resolve({ mupdf_version: "1.26.0", mupdf_version_ok: true, page_size: 4096, rss_mb: 123.456 });
+        case "engine_info": {
+          if (opts.engineInfoReject) return Promise.reject(new Error("engine_info refused for /storage/emulated/0/SENTINEL-name.pdf"));
+          const info = { mupdf_version: "1.26.0", mupdf_version_ok: true, page_size: 4096, rss_mb: 123.456 };
+          // app_version comes from the stub (opts.appVersion; null leaves the field out), never from the page.
+          if (opts.appVersion !== null) info.app_version = opts.appVersion === undefined ? "0.0.0-stub" : opts.appVersion;
+          return Promise.resolve(info);
+        }
         case "move_to_back":
           return Promise.resolve(true);
         default:

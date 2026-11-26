@@ -446,3 +446,90 @@ fn repro_trim_before_open_is_not_replayed() {
     assert!(matches!(last, Event::Fit { .. }), "trim before open gave {}", short(last));
     assert_eq!(e.stats().reads_abandoned, 0);
 }
+
+
+/// DS.4 / bug sweep BUG-06: a second hard trim during the re-read does not force direct mode; the page
+/// is read again with a list (direct mode is for the list guard and the soft limit only).
+#[test]
+fn repro_second_hard_trim_reads_again_not_direct() {
+    let _g = serial();
+    let Some(path) = corpus("heavy.pdf") else { eprintln!("SKIP: heavy.pdf missing"); return };
+    let e = Engine::start_with(GuardConfig { list_guard_mb: 0.0, soft_limit_mb: 0.0 }).expect("start");
+    open(&e, &path);
+    mem::trim();
+    assert!(e.send(Request::ShowPage { page: 0, fit_width: FIT_WIDTH }));
+    until(&e, Duration::from_secs(10), |ev| matches!(ev, Event::Progress { stage: Stage::Read, ops, .. } if *ops > 0));
+    std::thread::sleep(Duration::from_millis(300));
+    for n in 1..=2u64 {
+        let t = Instant::now();
+        guard::request_trim(TrimKind::LowMemory);
+        while e.stats().reads_abandoned < n {
+            assert!(t.elapsed() < Duration::from_secs(2), "read {n} not stopped by the hard trim");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        std::thread::sleep(Duration::from_millis(400)); // let the next read get going
+    }
+    let tail = until(&e, LONG, |ev| matches!(ev, Event::Fit { .. } | Event::DirectMode { .. } | Event::Error { .. }));
+    let last = &tail.last().unwrap().1;
+    assert!(matches!(last, Event::Fit { page: 0, .. }), "two hard trims mid-read gave {}", short(last));
+    assert_eq!(e.stats().reads_abandoned, 2);
+}
+
+/// DS.4 / bug sweep BUG-04: a hard trim whose wake-up is drained behind a skipped request still releases
+/// memory, without waiting for another request.
+#[test]
+fn repro_trim_wake_behind_a_skipped_region_still_releases() {
+    let _g = serial();
+    let Some(path) = corpus("lines.pdf") else { eprintln!("SKIP: lines.pdf missing"); return };
+    let e = Engine::start_with(GuardConfig { list_guard_mb: 0.0, soft_limit_mb: 0.0 }).expect("start");
+    open(&e, &path);
+    assert!(e.send(Request::ShowPage { page: 0, fit_width: 400 }));
+    until(&e, LONG, |ev| matches!(ev, Event::Fit { .. }));
+    let b = greenline_engine::Doc::open(&path).unwrap().page_bounds(0).unwrap();
+    let (x0, y0) = b.tile_origin_at(16.0, 0.3, 0.3);
+    // A long region keeps the engine busy; a stale one and the trim's wake-up queue up behind it.
+    assert!(e.send(Request::Region { id: 1, page: 0, zoom: 16.0, x0, y0, w: 4096, h: 2048, gen: 5 }));
+    std::thread::sleep(Duration::from_millis(200));
+    assert!(e.send(Request::Region { id: 2, page: 0, zoom: 16.0, x0, y0, w: 256, h: 256, gen: 3 }));
+    guard::request_trim(TrimKind::TrimMemory);
+    let evs = until(&e, LONG, |ev| matches!(ev, Event::TileSkipped { id: 2, .. }));
+    let released_before = evs.iter().any(|(_, ev)| matches!(ev, Event::MemoryReleased { had_list: true, .. }));
+    if !released_before {
+        match e.events().recv_timeout(Duration::from_secs(3)) {
+            Ok(Event::MemoryReleased { reason: MemReason::Trim, had_list: true, .. }) => {}
+            other => panic!("the trim was swallowed: expected MemoryReleased, got {:?}", other.map(|ev| short(&ev))),
+        }
+    }
+}
+
+/// DS.4 / bug sweep BUG-05: over the soft limit, asking for another page releases the old page's list
+/// but does not mark the old page as direct.
+#[test]
+fn repro_soft_limit_on_page_change_does_not_mark_the_old_page_direct() {
+    let _g = serial();
+    let Some(path) = corpus("set.pdf") else { eprintln!("SKIP: set.pdf missing"); return };
+    mem::trim();
+    let rss0 = mem::rss_mb();
+    let soft = rss0 + 150.0;
+    let e = Engine::start_with(GuardConfig { list_guard_mb: 0.0, soft_limit_mb: soft }).expect("start");
+    open(&e, &path);
+    assert!(e.send(Request::ShowPage { page: 0, fit_width: 400 }));
+    until(&e, LONG, |ev| matches!(ev, Event::Fit { .. } | Event::DirectMode { .. }));
+    // Something else in the process takes the RSS past the soft limit.
+    let mut ballast: Vec<u8> = vec![0u8; 300 << 20];
+    for i in (0..ballast.len()).step_by(4096) {
+        ballast[i] = 1; // touch every page so it counts in RSS
+    }
+    let ballast = std::hint::black_box(ballast);
+    let rss = mem::rss_mb();
+    assert!(rss > soft, "ballast did not raise RSS past the soft limit ({rss:.0} MB, limit {soft:.0} MB)");
+    assert!(e.send(Request::ShowPage { page: 1, fit_width: 400 }));
+    let evs = until(&e, LONG, |ev| matches!(ev, Event::Fit { page: 1, .. } | Event::Error { .. }) || matches!(ev, Event::DirectMode { page: 1, .. }));
+    let names: Vec<String> = evs.iter().filter(|(_, ev)| !matches!(ev, Event::Progress { .. })).map(|(_, ev)| short(ev)).collect();
+    drop(ballast);
+    assert!(
+        !evs.iter().any(|(_, ev)| matches!(ev, Event::DirectMode { page: 0, .. })),
+        "the page being left was marked direct: {names:?}"
+    );
+    assert!(evs.iter().any(|(_, ev)| matches!(ev, Event::MemoryReleased { had_list: true, .. })), "list not released: {names:?}");
+}

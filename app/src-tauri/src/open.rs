@@ -221,3 +221,9 @@ pub fn show_page(host: State<'_, Arc<Host>>, page: i32, fit_width: u32) -> bool 
 pub fn cancel(host: State<'_, Arc<Host>>) -> bool {
     host.cancel()
 }
+
+/// The viewer no longer wants sharp-view region `gen` (or older): stop drawing it.
+#[tauri::command]
+pub fn drop_sharp(host: State<'_, Arc<Host>>, gen: u64) {
+    host.drop_regions(gen);
+}

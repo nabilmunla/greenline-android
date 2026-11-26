@@ -480,10 +480,45 @@
       eq(p.qa("#menu button").map((b) => b.textContent).join("|"), "Settings|About");
       await p.click(p.qa("#menu button")[1]);
       ok(p.visible(p.$("about")), "sheet open");
-      ok(p.$("about").innerText.indexOf("Version 0.1.7") >= 0, "version");
+      eq(p.$("a_version").textContent, "Version 0.0.0-stub");
       eq(p.$("a_mupdf").textContent, "MuPDF 1.26.0 (verified)");
       const c = p.rect(p.$("about_close"));
       ok(c.width >= 48 && c.height >= 48, "close button " + c.width + "x" + c.height);
+    }));
+
+    await test("About: Developer Engine info shows a fixed code when engine_info fails, never the raw error text", () => withPage({ recents: [], engineInfoReject: true }, async (p) => {
+      await p.win.GLStart.openAbout();
+      p.$("dev").open = true;
+      await p.click(p.$("d_info"));
+      ok(!p.$("d_err").hidden, "error line shown");
+      eq(p.$("d_err").textContent, "E_ENGINE_INFO");
+      ok(p.$("about").innerHTML.indexOf("SENTINEL") < 0 && p.$("about").innerHTML.indexOf("/storage") < 0, "no raw error text anywhere on the sheet");
+    }));
+
+    await test("About: the version shown is the engine_info app_version of the stub, not text in the HTML", () => withPage({ recents: [], appVersion: "9.8.7" }, async (p) => {
+      await p.win.GLStart.openAbout();
+      await sleep(60);
+      eq(p.$("a_version").textContent, "Version 9.8.7");
+      ok(p.$("about").innerText.indexOf("0.1.7") < 0, "no hard-coded number left on the sheet");
+    }));
+
+    await test("About: engine_info failing shows a fixed fallback, never an old number", () => withPage({ recents: [], engineInfoReject: true }, async (p) => {
+      await p.win.GLStart.openAbout();
+      await sleep(60);
+      eq(p.$("a_version").textContent, "Version not available");
+      eq(p.$("a_mupdf").textContent, "MuPDF version not available");
+    }));
+
+    await test("About: an engine_info without app_version shows the fixed fallback", () => withPage({ recents: [], appVersion: null }, async (p) => {
+      await p.win.GLStart.openAbout();
+      await sleep(60);
+      eq(p.$("a_version").textContent, "Version not available");
+    }));
+
+    await test("About: an app_version with markup, a path or spaces is not shown", () => withPage({ recents: [], appVersion: "<b>x</b> /home/a b" }, async (p) => {
+      await p.win.GLStart.openAbout();
+      await sleep(60);
+      eq(p.$("a_version").textContent, "Version not available");
     }));
 
     await test("About: Developer is collapsed and holds Engine info, the probe numbers and Speed test", () => withPage({ recents: [] }, async (p) => {

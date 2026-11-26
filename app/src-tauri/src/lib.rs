@@ -90,6 +90,7 @@ pub fn run() {
             open::close_doc,
             open::show_page,
             open::cancel,
+            open::drop_sharp,
             measure::measure_start,
             measure::measure_plan,
             measure::measure_step,

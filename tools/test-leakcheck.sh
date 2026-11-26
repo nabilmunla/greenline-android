@@ -225,6 +225,62 @@ echo "this is not a zip" >"$T/garbage.zip"
 expect_fail "corrupt archive fails (cannot be inspected)" "$T/garbage.zip" "cannot"
 expect_fail "missing target fails" "$T/no-such-file.zip" "not found"
 
+# 9b. unzip exit status 1 means "success with warnings"; a member may then have been skipped or
+# extracted under another name, so it may never be content-scanned. leakcheck must fail closed.
+# (i) real unzip: an absolute-path member makes unzip warn and exit 1.
+cat >"$T/mkabs.py" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_STORED) as z:
+    z.writestr("readme.txt", "hello, nothing to see\n")
+    z.writestr("/payload.bin", b"clean absolute path member\n")
+PY
+python3 -I "$T/mkabs.py" "$T/abs.zip"
+unzip -qq -o -d "$T/abs_x" "$T/abs.zip" </dev/null >/dev/null 2>&1
+ABSRC=$?
+if ((ABSRC == 1)); then report "fixture check: real unzip exits 1 on the absolute-path zip" 1 ""; else report "fixture check: real unzip exits 1 on the absolute-path zip" 0 "unzip rc=$ABSRC"; fi
+expect_fail "zip that makes unzip exit 1 (warning) fails, never passes" "$T/abs.zip" "cannot unpack archive"
+
+# (ii) a unzip stand-in that skips one member and exits 1, as the unzip manual describes for
+# unsupported methods or unknown passwords (the real unzip here exits 81 for those, so simulate).
+REALUNZIP=$(command -v unzip)
+mkdir -p "$T/shim"
+cat >"$T/shim/unzip" <<SH
+#!/usr/bin/env bash
+for a in "\$@"; do [[ \$a == -Z1 ]] && exec "$REALUNZIP" "\$@"; done
+"$REALUNZIP" "\$@"
+d=""; prev=""
+for a in "\$@"; do [[ \$prev == -d ]] && d=\$a; prev=\$a; done
+rm -f "\$d/blob.bin"
+exit 1
+SH
+chmod +x "$T/shim/unzip"
+OUT=$(PATH="$T/shim:$PATH" GL_DENYLIST="$DL" "$LC" "$T/denybin.zip" 2>&1)
+RC=$?
+if ((RC == 1)) && grep -q '^LEAKCHECK FAIL: cannot unpack archive' <<<"$OUT" && ! grep -qiF -e "$DENYSTR" <<<"$OUT"; then
+    report "member skipped with unzip exit 1 (blob.bin is the secret carrier) fails" 1 ""
+else
+    report "member skipped with unzip exit 1 (blob.bin is the secret carrier) fails" 0 "rc=$RC"
+fi
+# 9c. two entries with the same path: unzip -o keeps only the last one, so an earlier PDF (or secret)
+# would never reach the content scan. The archive must fail, without printing the entry name.
+cat >"$T/mkdup.py" <<'PY'
+import sys, warnings, zipfile
+warnings.simplefilter("ignore")
+out, first = sys.argv[1], sys.argv[2]
+with zipfile.ZipFile(out, "w", zipfile.ZIP_STORED) as z:
+    z.writestr("readme.txt", "hello, nothing to see\n")
+    z.writestr("same.bin", b"%PDF-1.7\nfirst copy\n" if first == "pdf" else b"clean first copy\n")
+    z.writestr("same.bin", b"clean last copy\n")
+PY
+python3 -I "$T/mkdup.py" "$T/dup.zip" pdf
+expect_fail "zip with a PDF first and a clean file of the same name last fails" "$T/dup.zip" "same path"
+run "$DL" "$T/dup.zip"
+if grep -qF "same.bin" <<<"$OUT"; then report "duplicate-path failure does not print the entry name" 0 "name printed"; else report "duplicate-path failure does not print the entry name" 1 ""; fi
+# nested: the duplicate is inside an inner archive
+stage dup_nested
+cp "$T/dup.zip" "$T/dup_nested/inner.jar"
+mkzip "$T/dup_nested.zip" "$T/dup_nested"
+expect_fail "duplicate path inside a nested jar fails" "$T/dup_nested.zip" "same path"
 # 10. git history (bundle): a PDF or secret that was committed and later removed
 git_commit() { git -c user.name=t -c user.email=t@example.invalid -c commit.gpgsign=false "$@"; }
 mkrepo() {

@@ -271,9 +271,20 @@
   const SHARP_MAX_PX = 8.0e6;        // ~32 MB RGBA at most per region
   const DIRECT_MAX_PX_PER_PT = 4;    // direct mode (no list) stays at the old 400 % limit
   let sharpCtrl = null;
+  let regionGen = 0; // every sharp request gets a newer gen; the engine stops older ones (DS.1)
+
+  // Abandon the sharp request in flight: the fetch, and the engine's draw of it (an aborted fetch alone
+  // leaves the engine drawing a region nobody will see, and the next view waits behind it).
+  function abortSharp() {
+    if (!sharpCtrl) return;
+    const g = sharpCtrl.glGen;
+    sharpCtrl.abort();
+    sharpCtrl = null;
+    Promise.resolve().then(() => invoke("drop_sharp", { gen: g })).catch(() => { /* engine gone */ });
+  }
 
   function dropSharp() {
-    if (sharpCtrl) { sharpCtrl.abort(); sharpCtrl = null; }
+    abortSharp();
     if (S.sharp) { S.sharp.bmp.close(); S.sharp = null; }
   }
 
@@ -298,7 +309,7 @@
   }
 
   async function requestSharp() {
-    if (sharpCtrl) { sharpCtrl.abort(); sharpCtrl = null; }
+    abortSharp();
     if (S.doc === null || S.stopped || gest) return;
     const r = sharpRegion();
     if (!r) return;
@@ -308,8 +319,9 @@
         r.x0 >= cur.x0 && r.y0 >= cur.y0 && r.x0 + r.w <= cur.x0 + cur.w && r.y0 + r.h <= cur.y0 + cur.h) return;
     if (gest) S.stats.gestureFetches++; // must stay 0
     const ctrl = new AbortController();
+    const gen = ++regionGen, doc = S.doc, page = S.page;
+    ctrl.glGen = gen;
     sharpCtrl = ctrl;
-    const gen = S.gen, doc = S.doc, page = S.page;
     const url = GL + "tile?page=" + page + "&zoom=" + r.z + "&x0=" + r.x0 + "&y0=" + r.y0 + "&w=" + r.w + "&h=" + r.h + "&gen=" + gen;
     const t0 = performance.now();
     let bmp = null;

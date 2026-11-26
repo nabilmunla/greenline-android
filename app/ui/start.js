@@ -341,11 +341,20 @@
     return "MuPDF " + i.mupdf_version + (i.mupdf_version_ok ? " (verified)" : " (version check FAILED)");
   }
 
+  // The app version comes from the app itself (engine_info.app_version, the Cargo package version), so it
+  // cannot go stale in the HTML. Only a plain version token is shown; anything else gets the fixed fallback.
+  function versionText(i) {
+    const v = i && i.app_version;
+    return typeof v === "string" && /^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$/.test(v) ? "Version " + v : "Version not available";
+  }
+
   async function fillMupdf() {
     try {
       const i = await invoke("engine_info");
+      $("a_version").textContent = versionText(i);
       $("a_mupdf").textContent = mupdfText(i);
     } catch (_) {
+      $("a_version").textContent = "Version not available";
       $("a_mupdf").textContent = "MuPDF version not available";
     }
   }
@@ -377,6 +386,7 @@
 
   function openAbout() {
     if (!openSheet("about", "about", "about_close")) return;
+    $("a_version").textContent = "Version …";
     $("a_mupdf").textContent = "MuPDF …";
     fillMupdf();
   }
@@ -418,13 +428,15 @@
     try {
       const i = await invoke("engine_info");
       const v = mupdfText(i);
+      $("a_version").textContent = versionText(i);
       $("a_mupdf").textContent = v;
       $("mupdf").textContent = v;
       $("page").textContent = i.page_size + " bytes";
       $("rss").textContent = (typeof i.rss_mb === "number" ? i.rss_mb.toFixed(1) : "?") + " MB";
       $("out").hidden = false;
-    } catch (e) {
-      $("d_err").textContent = "engine_info failed: " + (e && e.message ? e.message : String(e));
+    } catch (_) {
+      // A fixed code only: the error text of a failed call can carry paths or names.
+      $("d_err").textContent = "E_ENGINE_INFO";
       $("d_err").hidden = false;
     }
   }

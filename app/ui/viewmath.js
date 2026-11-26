@@ -9,7 +9,7 @@
  *     point (X, Y) is drawn at viewport CSS px ((X-ox)*s, (Y-oy)*s).
  *   - ptW/ptH = page size in points; viewW/viewH = viewport size in CSS px.
  *   - Engine tiles are addressed in pixels at the engine level L (device px per
- *     point; viewer.js calls it TILE_ZOOM, 4 = 400 %): x0 = tx*TILE, y0 = ty*TILE.
+ *     point; viewer.js LEVELS holds the levels, 4 = 400 %): x0 = tx*TILE, y0 = ty*TILE.
  *   - Views are returned as new objects; inputs are never mutated.
  */
 (function (root) {
@@ -18,7 +18,7 @@
   // ---- thresholds (from docs/PLAN.md, Part 2b-fix, decision 4) ----
   var C = {
     TILE: 1024,            // tile edge, px at the engine level
-    LEVELS: [2, 4],        // engine levels available for tiles
+    LEVELS: [2, 4],        // engine levels of the cached tiles viewer.js still draws (no tile fetching since 2c.2)
     MAX_PX_PER_PT: 16,     // 1600 % (task 2c.2; was 400 %): device px per point at full zoom
     ZOOMED_FACTOR: 1.05,   // "zoomed" means s > fit * 1.05
     TAP_MOVE_PX: 10,       // tap: moved less than this ...
@@ -38,7 +38,7 @@
     return Math.min(viewW / ptW, viewH / ptH);
   }
 
-  // Largest allowed scale for a device pixel ratio: 4 device px per point.
+  // Largest allowed scale for a device pixel ratio: 16 device px per point (1600 %).
   function maxScale(dpr) { return C.MAX_PX_PER_PT / dpr; }
 
   // True when the view is zoomed in beyond the fit tolerance (5 %).
@@ -101,20 +101,6 @@
     var ax = view.ox + px / view.s;
     var ay = view.oy + py / view.s;
     return { s: s1, ox: ax - px / s1, oy: ay - py / s1 };
-  }
-
-  // Engine level for the current scale. need = s*dpr device px per point.
-  // Returns 0 ("use the fit image") when need <= fitImagePxPerPt (if given),
-  // else the smallest level in `levels` that is >= need, else the largest level.
-  function chooseLevel(s, dpr, levels, fitImagePxPerPt) {
-    var lv = levels || C.LEVELS;
-    var need = s * dpr;
-    var eps = 1e-9;
-    if (typeof fitImagePxPerPt === "number" && need <= fitImagePxPerPt + eps) return 0;
-    for (var i = 0; i < lv.length; i++) {
-      if (lv[i] >= need - eps) return lv[i];
-    }
-    return lv[lv.length - 1];
   }
 
   // Tiles covering the visible part of the page at an engine level, clipped to
@@ -216,6 +202,6 @@
     fitScale: fitScale, maxScale: maxScale, isZoomed: isZoomed,
     clampScale: clampScale, clampOffset: clampOffset,
     pinch: pinch, pinchClamped: pinchClamped, zoomAt: zoomAt,
-    chooseLevel: chooseLevel, visibleTiles: visibleTiles, classify: classify
+    visibleTiles: visibleTiles, classify: classify
   };
 })(typeof window !== "undefined" ? window : this);

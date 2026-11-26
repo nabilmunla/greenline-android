@@ -251,13 +251,22 @@ unpack_and_scan() {
         fail "cannot read archive (corrupt or not a zip): $(safe_name "${prefix%!/}")"
         return
     fi
+    # Two entries with the same path: unzip -o keeps only the last, so the earlier one would never be
+    # content-scanned. Fail closed (the name is not printed).
+    if [[ -n $(LC_ALL=C sort "$raw" | LC_ALL=C uniq -d | head -n 1) ]]; then
+        rm -f "$raw"
+        fail "archive has two entries with the same path, so it cannot be inspected: $(safe_name "${prefix%!/}")"
+        return
+    fi
     tr '\n' '\0' <"$raw" >"$raw.0"
     check_names "$raw.0" "$prefix"
     rm -f "$raw" "$raw.0"
     unzip -qq -o -d "$d" "$archive" </dev/null >/dev/null 2>&1
     rc=$?
-    if ((rc > 1)); then
-        fail "cannot unpack archive (encrypted or corrupt), so it cannot be inspected: $(safe_name "${prefix%!/}")"
+    # Any non-zero status fails closed: 1 means "success with warnings" (members skipped, renamed or
+    # partly written), and a member that was not extracted would never be content-scanned.
+    if ((rc != 0)); then
+        fail "cannot unpack archive cleanly (encrypted, corrupt or unzip warnings), so it cannot be inspected: $(safe_name "${prefix%!/}")"
         return
     fi
     chmod -R u+rwX "$d" 2>/dev/null

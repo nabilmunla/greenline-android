@@ -7,7 +7,7 @@
 //! - `GET /img?id=N`: a low-res or fit image the dispatcher stored for the UI (announced by a
 //!   `gl-image` event carrying `id`). Each image can be fetched once; 404 after that or when evicted.
 //!
-//! Every response carries `Access-Control-Allow-Origin: *` (the page is `http://tauri.localhost`, a
+//! Every response carries `Access-Control-Allow-Origin` for the app's own page only (the page is `http://tauri.localhost`, a
 //! different origin) and exposes `X-Gl-Render-Ms`, `X-Gl-W`, `X-Gl-H`, plus `X-Gl-Gen`, `X-Gl-Wait-Ms`
 //! (handler -> engine answer, so the JS side can split engine time from handoff time) and `X-Gl-Error`.
 //!
@@ -36,6 +36,13 @@ pub const MAX_ZOOM: f32 = 64.0;
 /// Headers the page may read on a cross-origin response.
 pub const EXPOSE_HEADERS: &str = "X-Gl-Render-Ms, X-Gl-W, X-Gl-H, X-Gl-Gen, X-Gl-Wait-Ms, X-Gl-Error";
 
+/// The app page's origin on Android (Tauri 2). Replies are readable by that page only (BUG-20).
+const APP_ORIGIN: &str = "http://tauri.localhost";
+
+/// Largest region origin accepted, in device pixels (BUG-08). A 200-inch page at the 1600 % maximum is
+/// about 230,000 px wide; anything near i32::MAX is a bad request.
+const MAX_ORIGIN: u32 = 1 << 24;
+
 /// A response: status, headers, body. Converted to an `http::Response` only at the Tauri edge.
 #[derive(Debug)]
 pub struct Reply {
@@ -49,7 +56,7 @@ impl Reply {
         Reply {
             status,
             headers: vec![
-                ("Access-Control-Allow-Origin", "*".into()),
+                ("Access-Control-Allow-Origin", APP_ORIGIN.into()),
                 ("Access-Control-Expose-Headers", EXPOSE_HEADERS.into()),
                 ("Cache-Control", "no-store".into()),
             ],
@@ -143,8 +150,8 @@ pub fn parse(path: &str, query: Option<&str>) -> Result<GlRequest, Reply> {
             let t = TileParams {
                 page: q.num("page").ok_or_else(bad)?,
                 zoom: q.num("zoom").ok_or_else(bad)?,
-                x0: q.num("x0").ok_or_else(bad)?,
-                y0: q.num("y0").ok_or_else(bad)?,
+                x0: q.num("x0").filter(|v: &i32| v.unsigned_abs() <= MAX_ORIGIN).ok_or_else(bad)?,
+                y0: q.num("y0").filter(|v: &i32| v.unsigned_abs() <= MAX_ORIGIN).ok_or_else(bad)?,
                 gen: q.num("gen").ok_or_else(bad)?,
                 w: q.num_or("w", TILE_SIDE).map_err(|_| bad())?,
                 h: q.num_or("h", TILE_SIDE).map_err(|_| bad())?,

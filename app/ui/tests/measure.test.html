@@ -1,0 +1,151 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>measure screen tests</title>
+<style>
+  body { font: 14px/1.4 monospace; margin: 12px; }
+  .pass { color: #0a7d2c; }
+  .fail { color: #c00; font-weight: bold; }
+  #result { font-size: 20px; font-weight: bold; margin: 12px 0; }
+  #stage { position: absolute; left: -10000px; top: 0; }
+</style>
+</head>
+<body>
+<h3>Measure screen tests (app/ui/measure.js inside ../measure.html, fake app, synthetic data only)</h3>
+<div id="result">RUNNING</div>
+<ul id="log"></ul>
+<div id="stage"></div>
+<script>
+(function () {
+  "use strict";
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const log = document.getElementById("log");
+  const stage = document.getElementById("stage");
+  let failures = 0, total = 0;
+
+  function ok(c, m) { if (!c) throw new Error(m || "assertion failed"); }
+  function eq(a, b, m) { if (a !== b) throw new Error((m || "values differ") + ": got " + JSON.stringify(a) + ", want " + JSON.stringify(b)); }
+
+  async function test(name, fn) {
+    total++;
+    const li = document.createElement("li");
+    try {
+      await fn();
+      li.className = "pass";
+      li.textContent = "PASS " + name;
+    } catch (e) {
+      failures++;
+      li.className = "fail";
+      li.textContent = "FAIL " + name + " -- " + (e && e.message ? e.message : e);
+    }
+    log.appendChild(li);
+  }
+
+  function measureHtml() {
+    const x = new XMLHttpRequest();
+    x.open("GET", "../measure.html", false);
+    x.send();
+    return x.responseText;
+  }
+
+  // A fake app: records every invoke, keeps the event listeners so the test can emit engine events.
+  function makeFake() {
+    const st = { calls: [], listeners: {} };
+    function invoke(cmd, args) {
+      st.calls.push({ cmd: cmd, args: args });
+      switch (cmd) {
+        case "measure_state":
+          return Promise.resolve({
+            used: [], next_label: 0, recovered: [], records: 0, summary: "[]",
+            marks: { first_view_ms: 1000, first_view_labels: ["f00"], tile_ms: 1000, refill_ms: 1000, page_ms: 100, peak_mb: 1024 },
+          });
+        case "measure_start":
+          return Promise.resolve({ doc: 7, pages: 3, fit_width: 400, since_fd_ms: 5 });
+        case "measure_end":
+        case "close_doc":
+        case "cancel":
+          return Promise.resolve(true);
+        default:
+          return Promise.reject({ code: "E_UNKNOWN_TEST_COMMAND" });
+      }
+    }
+    st.tauri = {
+      core: { invoke: invoke, convertFileSrc: () => "http://gl.localhost/" },
+      event: { listen: (name, cb) => { st.listeners[name] = cb; return Promise.resolve(() => {}); } },
+    };
+    st.emit = (name, payload) => st.listeners[name]({ payload: payload });
+    st.cmds = (c) => st.calls.filter((x) => x.cmd === c);
+    return st;
+  }
+
+  async function withMeasure(fn) {
+    const fake = makeFake();
+    window.__MF = fake;
+    const iframe = document.createElement("iframe");
+    iframe.style.cssText = "border:0;display:block;width:412px;height:800px";
+    stage.appendChild(iframe);
+    const base = new URL("../", location.href).href;
+    const html = measureHtml().replace("<head>", '<head><base href="' + base + '"><script>window.__TAURI__=parent.__MF.tauri;<\/script>');
+    const d = iframe.contentDocument;
+    d.open();
+    d.write(html);
+    d.close();
+    for (let i = 0; i < 100 && !fake.cmds("measure_state").length; i++) await sleep(20);
+    await sleep(40);
+    const $ = (id) => d.getElementById(id);
+    try { await fn({ fake: fake, $: $, win: iframe.contentWindow }); } finally { iframe.remove(); }
+  }
+
+  async function run() {
+    await test("page loads and reads the saved state", () => withMeasure(async (m) => {
+      eq(m.fake.cmds("measure_state").length, 1);
+      eq(m.$("label").options.length, 12);
+    }));
+
+    await test("a failed step (engine error) ends the run with cancelled:false and shows only a fixed code", () => withMeasure(async (m) => {
+      m.$("run").click();
+      await sleep(80);
+      eq(m.fake.cmds("measure_start").length, 1, "run started");
+      m.fake.emit("gl-error", { doc: 7, code: 4 });
+      await sleep(120);
+      const ends = m.fake.cmds("measure_end");
+      eq(ends.length, 1, "measure_end called once");
+      eq(ends[0].args.cancelled, false, "a failed step is not a cancel");
+      const err = m.$("err");
+      ok(!err.hidden, "error line shown");
+      eq(err.textContent, "Step failed: engine_error (engine code 4)");
+      ok(m.$("log").textContent.indexOf("Cancelled") < 0, "log does not say Cancelled");
+    }));
+
+    await test("Cancel ends the run with cancelled:true and logs Cancelled, no error line", () => withMeasure(async (m) => {
+      m.$("run").click();
+      await sleep(80);
+      m.$("cancel").click();
+      await sleep(120);
+      const ends = m.fake.cmds("measure_end");
+      eq(ends.length, 1, "measure_end called once");
+      eq(ends[0].args.cancelled, true, "a cancel is a cancel");
+      ok(m.$("err").hidden, "no error line");
+      ok(m.$("log").textContent.indexOf("Cancelled") >= 0, "log says Cancelled");
+    }));
+  }
+
+  run().then(() => {
+    document.getElementById("result").textContent = failures === 0 ? "ALL PASS" : "FAIL " + failures;
+    document.title = "measure screen tests: " + total + " cases";
+    const n = document.createElement("li");
+    n.textContent = total + " cases";
+    log.appendChild(n);
+  }, (e) => {
+    failures++;
+    const li = document.createElement("li");
+    li.className = "fail";
+    li.textContent = "HARNESS ERROR " + (e && e.stack ? e.stack : e);
+    log.appendChild(li);
+    document.getElementById("result").textContent = "FAIL " + failures;
+  });
+})();
+</script>
+</body>
+</html>

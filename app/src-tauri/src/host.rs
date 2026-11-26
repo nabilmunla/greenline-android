@@ -81,6 +81,14 @@ struct DirectState {
     reason: MemReason,
 }
 
+/// 64 random bits from the standard library's per-process random hash keys (no extra crate).
+fn random_u64() -> u64 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos() as u64).unwrap_or(0));
+    h.finish()
+}
+
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -147,11 +155,18 @@ impl Host {
                 *d = None;
             }
         }
+        // The engine client cancels the old page's work when another page is asked for (DS.2).
         self.client.send(Request::ShowPage { page, fit_width: fit_width.clamp(1, MAX_FIT_WIDTH) })
     }
 
     pub fn cancel(&self) -> bool {
         self.client.cancel()
+    }
+
+    /// The viewer dropped its sharp-view request `gen` without sending a newer one: stop drawing it
+    /// (and anything older) so the engine is free for the next request (DS.1).
+    pub fn drop_regions(&self, gen: u64) {
+        self.client.supersede_regions(gen.saturating_add(1));
     }
 
     fn doc(&self) -> u64 {
@@ -161,7 +176,9 @@ impl Host {
     fn store_image(&self, img: StoredImage) -> u64 {
         let mut g = lock(&self.images);
         g.next_id += 1;
-        let id = g.next_id;
+        // BUG-21: not guessable from the counter alone; unique (counter in the high bits) and below
+        // 2^53, so it survives JavaScript numbers.
+        let id = ((g.next_id & 0x7FFF_FFFF) << 21) | (random_u64() & 0x1F_FFFF);
         if g.items.len() >= MAX_IMAGES {
             g.items.pop_front();
         }
@@ -251,6 +268,11 @@ impl Host {
             let _ = w.send(Err(ErrorCode::OpenFailed));
         }
         slot.opening = None;
+        // BUG-23: the worker is gone, so nothing reads the open document any more: release its fd.
+        drop(slot.current.take());
+        drop(slot);
+        lock(&self.images).items.clear();
+        *lock(&self.direct) = None;
     }
 }
 

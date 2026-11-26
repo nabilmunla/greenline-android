@@ -78,7 +78,7 @@
 
   // The stub app + fake clock the iframe reads through window.parent.__V.
   function makeStub(pages) {
-    const V = { t: 1000, q: [], n: 0, errors: [], shown: [], listeners: {}, invokes: [] };
+    const V = { t: 1000, q: [], n: 0, errors: [], shown: [], listeners: {}, invokes: [], drops: [], tileFetch: null };
     V.raf = (cb) => { V.q.push([++V.n, cb]); return V.n; };
     V.caf = (id) => { V.q = V.q.filter((e) => e[0] !== id); };
     V.now = () => V.t;
@@ -99,6 +99,9 @@
         case "close_doc":
         case "cancel":
           return Promise.resolve(true);
+        case "drop_sharp":
+          V.drops.push(args.gen);
+          return Promise.resolve(null);
         default:
           return Promise.reject(new Error("unknown command"));
       }
@@ -107,7 +110,8 @@
       core: { invoke: V.invoke, convertFileSrc: () => "http://gl.localhost/" },
       event: { listen: (name, cb) => { V.listeners[name] = cb; return Promise.resolve(() => {}); } },
     };
-    V.fetch = (url) => {
+    V.fetch = (url, opt) => {
+      if (V.tileFetch && /tile\?/.test(String(url))) return V.tileFetch(String(url), opt || {});
       const m = /img\?id=(\d+)/.exec(String(url));
       const none = { status: 204, headers: { get: () => null }, arrayBuffer: async () => new ArrayBuffer(0) };
       if (!m) return Promise.resolve(none);
@@ -455,6 +459,32 @@
         eq(p.page(), 1, "back at fit, the swipe changes page");
       }));
     }
+
+    // ---------------------------------------------------------------- sharp view requests (DS.1)
+    await test("sharp view: each request has a newer gen, and a dropped one is stopped in the engine (drop_sharp)", () => withViewer({}, async (p) => {
+      const gens = [];
+      p.V.tileFetch = (url, opt) => {
+        gens.push(+/[?&]gen=(\d+)/.exec(url)[1]);
+        return new Promise((_, rej) => { if (opt.signal) opt.signal.addEventListener("abort", () => rej(new Error("aborted"))); });
+      };
+      p.tap(180, 370);
+      p.V.t += 100;
+      p.tap(180, 370); // double tap: zoom to 400 %
+      p.idle();
+      await sleep(300); // the view settles (150 ms) and asks for a sharp region
+      eq(gens.length, 1, "one sharp request after zooming");
+      p.drag([100, 370], [200, 370], 400);
+      p.idle();
+      await sleep(300);
+      eq(gens.length, 2, "a newer request after panning");
+      ok(gens[1] > gens[0], "newer gen " + gens.join(","));
+      ok(p.V.drops.indexOf(gens[0]) >= 0, "the first request was dropped in the engine: " + p.V.drops.join(","));
+      p.$("v_fit").click();
+      p.idle();
+      await sleep(300);
+      ok(gens.length === 2 || gens[2] > gens[1], "any request at fit is newer still: " + gens.join(","));
+      ok(p.V.drops.indexOf(gens[1]) >= 0, "back at fit, the pending request was dropped too: " + p.V.drops.join(","));
+    }));
 
     // ---------------------------------------------------------------- pref read on every show
     await test("the pref is read each time the viewer is shown (resume), not once; no GLPrefs means vertical", () => withViewer({ dir: "vertical" }, async (p) => {

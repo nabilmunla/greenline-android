@@ -233,6 +233,14 @@ struct Shared {
     /// Why the progress thread aborted the current read (a [`MemReason`] code; 0 = it did not). Set
     /// before the cookie's abort flag, cleared by `begin_run`, so an abort with no reason is a cancel.
     reason: AtomicU8,
+    /// Sharp-view regions with a lower `gen` are stale (DS.1): queued ones are skipped, and the one being
+    /// drawn is stopped. Only grows. Raised by every `Region` sent and by `supersede_regions`.
+    region_floor: AtomicU64,
+    /// `gen` of the region whose draw is running now (0 = none). Read and written under this lock, so
+    /// a supersede can only abort the cookie while that draw (never a read) is running.
+    region_slot: Mutex<u64>,
+    /// Page of the last `ShowPage` sent since the last `Open`/`Close` (DS.2). Another page cancels first.
+    shown: Mutex<Option<i32>>,
     limits: GuardConfig,
     counters: Counters,
     watch: Mutex<Watch>,
@@ -261,7 +269,23 @@ impl EngineClient {
     pub fn send(&self, req: Request) -> bool {
         match req {
             Request::Cancel => self.cancel(),
-            r => self.tx.send(Msg::Req(r)).is_ok(),
+            r => {
+                match &r {
+                    Request::Region { gen, .. } => self.supersede_regions(*gen),
+                    Request::Open { .. } | Request::Close => *self.shown() = None,
+                    Request::ShowPage { page, .. } => {
+                        // Another page: stop the old page's read or render first, or the new page waits
+                        // for all of it (a heavy sheet's read is 10-30 s). The same page keeps its work.
+                        let mut shown = self.shown();
+                        if shown.is_some_and(|p| p != *page) {
+                            self.cancel();
+                        }
+                        *shown = Some(*page);
+                    }
+                    _ => {}
+                }
+                self.tx.send(Msg::Req(r)).is_ok()
+            }
         }
     }
 
@@ -271,6 +295,21 @@ impl EngineClient {
         self.shared.cancels_sent.fetch_add(1, SeqCst);
         self.shared.cookie.abort();
         self.tx.send(Msg::Req(Request::Cancel)).is_ok()
+    }
+
+    fn shown(&self) -> MutexGuard<'_, Option<i32>> {
+        self.shared.shown.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Make every sharp-view region with `gen < below` stale: queued ones are skipped (TileSkipped) and
+    /// the one being drawn stops at MuPDF's next check. A display-list read is never stopped by this, so
+    /// the newer region does not have to read the page again. Sending a `Region` does this for its gen.
+    pub fn supersede_regions(&self, below: u64) {
+        self.shared.region_floor.fetch_max(below, SeqCst);
+        let slot = self.shared.region_slot.lock().unwrap_or_else(|e| e.into_inner());
+        if *slot != 0 && *slot < below {
+            self.shared.cookie.abort();
+        }
     }
 
     pub fn stats(&self) -> Stats {
@@ -303,6 +342,12 @@ pub struct Engine {
     waker: u64,
 }
 
+/// MuPDF anti-aliasing level for every engine render (bug sweep BUG-11: approved, never applied).
+pub const ENGINE_AA_LEVEL: i32 = 4;
+
+/// Display-list reads of one page that hard trims may stop before it is drawn directly (BUG-06).
+const MAX_TRIM_READS: u32 = 3;
+
 /// Engine thread stack: MuPDF recurses on nested forms and groups; 2 MiB (Rust's default) is tight.
 const ENGINE_STACK: usize = 8 << 20;
 
@@ -321,6 +366,9 @@ impl Engine {
             cookie: SharedCookie::new(),
             cancels_sent: AtomicU64::new(0),
             reason: AtomicU8::new(0),
+            region_floor: AtomicU64::new(0),
+            region_slot: Mutex::new(0),
+            shown: Mutex::new(None),
             limits,
             counters: Counters::default(),
             watch: Mutex::new(Watch::default()),
@@ -335,6 +383,9 @@ impl Engine {
         };
         let worker_shared = shared.clone();
         let spawned = thread::Builder::new().name("gl-engine".into()).stack_size(ENGINE_STACK).spawn(move || {
+            // The approved anti-aliasing level (BASELINE: faster than MuPDF's default 8; owner's visual
+            // check on the phone). Per thread: this is the only thread that draws.
+            crate::set_aa_level(ENGINE_AA_LEVEL);
             Worker {
                 rx: req_rx,
                 tx: ev_tx,
@@ -343,6 +394,7 @@ impl Engine {
                 pending: VecDeque::new(),
                 cancels_seen: 0,
                 latest_gen: 0,
+                woke: false,
                 trim_seen,
                 hard_seen,
                 direct: None,
@@ -529,6 +581,8 @@ struct Worker {
     cancels_seen: u64,
     /// Highest tile `gen` received for the open document.
     latest_gen: u64,
+    /// `drain` took a trim wake-up off the queue; `next` acts on it before it waits again (BUG-04).
+    woke: bool,
     /// Last trim request (`guard::trim_seq`) this engine has handled.
     trim_seen: u64,
     /// Last hard trim request (`guard::hard_trim_seq`) this engine has handled.
@@ -577,8 +631,8 @@ impl Worker {
                     mem::trim();
                 }
                 Request::ShowPage { page, fit_width } => self.show_page(page, fit_width),
-                Request::Tile { id, page, zoom, x0, y0, gen } => self.tile(id, page, zoom, x0, y0, TILE_SIZE, TILE_SIZE, gen),
-                Request::Region { id, page, zoom, x0, y0, w, h, gen } => self.tile(id, page, zoom, x0, y0, w, h, gen),
+                Request::Tile { id, page, zoom, x0, y0, gen } => self.tile(id, page, zoom, x0, y0, TILE_SIZE, TILE_SIZE, gen, false),
+                Request::Region { id, page, zoom, x0, y0, w, h, gen } => self.tile(id, page, zoom, x0, y0, w, h, gen, true),
                 Request::Cancel => {
                     self.cancels_seen += 1;
                     self.emit(Event::Cancelled);
@@ -599,10 +653,16 @@ impl Worker {
             if let Some(r) = self.pending.pop_front() {
                 return Some(r);
             }
+            if std::mem::take(&mut self.woke) {
+                // A wake-up drained during the last request (which may have ended early, before its own
+                // memory check): handle the trim now, not at the next request.
+                self.memory_check(None);
+                self.note_store();
+            }
             match self.rx.recv().ok()? {
                 Msg::Req(r) => return Some(r),
                 Msg::Wake => {
-                    self.memory_check();
+                    self.memory_check(None);
                     self.note_store();
                 }
             }
@@ -610,10 +670,13 @@ impl Worker {
     }
 
     /// Move everything waiting in the channel into `pending` (so stale work can be seen and skipped).
-    /// Wake-ups are dropped: the trim they announce is seen through `guard::trim_seq` between steps.
+    /// A wake-up is remembered in `woke`, so `next` handles its trim even if this request ends early.
     fn drain(&mut self) {
         while let Ok(m) = self.rx.try_recv() {
-            let Msg::Req(r) = m else { continue };
+            let Msg::Req(r) = m else {
+                self.woke = true;
+                continue;
+            };
             if let Request::Tile { gen, .. } | Request::Region { gen, .. } = r {
                 self.latest_gen = self.latest_gen.max(gen);
             }
@@ -631,6 +694,15 @@ impl Worker {
 
     fn error(&self, code: ErrorCode, tile: Option<u64>) {
         self.emit(Event::Error { code, tile });
+    }
+
+    /// A newer sharp-view region has been sent (or the viewer dropped this one).
+    fn region_stale(&self, gen: u64) -> bool {
+        gen < self.shared.region_floor.load(SeqCst)
+    }
+
+    fn region_slot(&self) -> MutexGuard<'_, u64> {
+        self.shared.region_slot.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A cancel has been issued that this thread has not acknowledged yet.
@@ -713,9 +785,11 @@ impl Worker {
     }
 
     /// Between steps, and when woken by a trim while idle: handle a pending trim, then the soft limit.
-    /// Both drop the list and empty the store; above the soft limit the dropped list's page also goes to
-    /// direct mode (reading it again would pass the limit again).
-    fn memory_check(&mut self) {
+    /// Both drop the list and empty the store. Above the soft limit the dropped list's page also goes to
+    /// direct mode (reading it again would pass the limit again), but only if it is the page about to be
+    /// drawn (`target`; None = idle, the list's page is the one on screen). A page being left only loses
+    /// its list (BUG-05).
+    fn memory_check(&mut self, target: Option<i32>) {
         let seq = guard::trim_seq();
         if seq > self.trim_seen {
             self.trim_seen = seq;
@@ -733,7 +807,7 @@ impl Worker {
         if soft > 0.0 && mem::rss_mb() > soft {
             let page = self.list.as_ref().map(|l| l.page);
             if self.release_for(MemReason::SoftLimit) {
-                if let Some(p) = page {
+                if let Some(p) = page.filter(|p| target.map_or(true, |t| t == *p)) {
                     self.go_direct(p, MemReason::SoftLimit);
                 }
             }
@@ -867,26 +941,24 @@ impl Worker {
         }
         self.direct = None; // another page: direct mode ends, the new page gets a list again
         let t = Instant::now();
-        match self.ensure_list(page, t0, ticks) {
-            // A hard trim stopped the read (task 2bf.2): release everything and read once more with a
-            // list. The list guard and the soft limit still watch the second read; only a second stop
-            // puts the page in direct mode.
-            Err(Stop::Memory(MemReason::Trim)) => {
-                self.trims_handled();
-                self.release_for(MemReason::Trim);
-                match self.ensure_list(page, t0, ticks) {
-                    Err(Stop::Memory(reason)) => {
-                        self.go_direct(page, reason);
-                        Ok(ms_since(t))
-                    }
-                    other => other,
+        let mut reads = 1;
+        loop {
+            match self.ensure_list(page, t0, ticks) {
+                // A hard trim stopped the read (task 2bf.2): release everything and read again with a
+                // list (BUG-06: a second trim gets another read too). The list guard and the soft limit
+                // still watch every read. Only after MAX_TRIM_READS trimmed reads is the page drawn
+                // directly, so it still shows on a phone that keeps trimming.
+                Err(Stop::Memory(MemReason::Trim)) if reads < MAX_TRIM_READS => {
+                    self.trims_handled();
+                    self.release_for(MemReason::Trim);
+                    reads += 1;
                 }
+                Err(Stop::Memory(reason)) => {
+                    self.go_direct(page, reason);
+                    return Ok(ms_since(t));
+                }
+                other => return other,
             }
-            Err(Stop::Memory(reason)) => {
-                self.go_direct(page, reason);
-                Ok(ms_since(t))
-            }
-            other => other,
         }
     }
 
@@ -939,7 +1011,7 @@ impl Worker {
         if fit_width == 0 {
             return self.error(ErrorCode::InvalidRequest, None);
         }
-        self.memory_check();
+        self.memory_check(Some(page));
         let list_ms = match self.prepare(page, t0, true) {
             Ok(ms) => ms,
             Err(Stop::Cancelled | Stop::Memory(_)) => return,
@@ -957,7 +1029,7 @@ impl Worker {
         if self.show_superseded() {
             return;
         }
-        self.memory_check();
+        self.memory_check(Some(page));
         if self.direct != Some(page) && self.list.is_none() {
             // A trim between the two images dropped the list: read it again for the Fit image.
             match self.prepare(page, t0, true) {
@@ -983,17 +1055,17 @@ impl Worker {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn tile(&mut self, id: u64, page: i32, zoom: f32, x0: i32, y0: i32, w: u32, h: u32, gen: u64) {
+    fn tile(&mut self, id: u64, page: i32, zoom: f32, x0: i32, y0: i32, w: u32, h: u32, gen: u64, region: bool) {
         // See everything queued first: a newer generation anywhere in the queue makes this one stale.
         self.latest_gen = self.latest_gen.max(gen);
         self.drain();
-        if gen < self.latest_gen || self.cancel_pending() {
+        if gen < self.latest_gen || (region && self.region_stale(gen)) || self.cancel_pending() {
             return self.skip_tile(id, gen);
         }
         if let Err(code) = self.check_page(page) {
             return self.error(code, Some(id));
         }
-        self.memory_check();
+        self.memory_check(Some(page));
         match self.prepare(page, Instant::now(), true) {
             Ok(_) => {}
             Err(Stop::Cancelled | Stop::Memory(_)) => return self.skip_tile(id, gen),
@@ -1009,6 +1081,14 @@ impl Worker {
         if !self.begin_run() {
             return self.skip_tile(id, gen);
         }
+        if region {
+            // From here a newer region may stop this draw. Superseded while the page was being read?
+            *self.region_slot() = gen;
+            if self.region_stale(gen) {
+                *self.region_slot() = 0;
+                return self.skip_tile(id, gen);
+            }
+        }
         let res = {
             let cookie = self.shared.cookie.mupdf();
             match list {
@@ -1016,6 +1096,9 @@ impl Worker {
                 None => guard::direct_region(doc, page, zoom, x0, y0, w, h, &cookie),
             }
         };
+        if region {
+            *self.region_slot() = 0;
+        }
         if self.run_stopped().is_some() {
             return self.skip_tile(id, gen);
         }

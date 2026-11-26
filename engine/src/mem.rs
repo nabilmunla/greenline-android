@@ -92,3 +92,10 @@ mod tests {
         assert!(p + 1.0 >= r, "peak {p} below rss {r}");
     }
 }
+
+/// Reset the peak (VmHWM) to the current RSS, so a measurement run reports its own peak instead of the
+/// process's lifetime peak (bug sweep BUG-07). Linux and Android: writes 5 to /proc/self/clear_refs.
+/// False if the kernel refused.
+pub fn reset_peak() -> bool {
+    std::fs::write("/proc/self/clear_refs", "5").is_ok()
+}
