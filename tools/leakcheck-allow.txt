@@ -1,0 +1,9 @@
+# leakcheck allow-list: files that may be larger than 20 MB.
+#
+# One glob pattern per line, matched against the path inside the APK/zip
+# (nested archives use "outer.zip!/inner/path"). "*" also matches "/".
+# Lines starting with # are comments; blank lines are ignored.
+# This only lifts the size limit. It never excuses a PDF or a deny-list hit.
+#
+# Add only known build outputs, for example the MuPDF engine library:
+lib/arm64-v8a/libapp_lib.so

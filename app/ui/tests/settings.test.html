@@ -1,0 +1,315 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>settings tests</title>
+<style>
+  body { font: 14px/1.4 monospace; margin: 12px; }
+  .pass { color: #0a7d2c; }
+  .fail { color: #c00; font-weight: bold; }
+  #result { font-size: 20px; font-weight: bold; margin: 12px 0; }
+  #stage { position: absolute; left: -10000px; top: 0; }
+</style>
+</head>
+<body>
+<h3>Settings tests (app/ui/prefs.js, and the Settings screen of start.js inside ../index.html)</h3>
+<div id="result">RUNNING</div>
+<ul id="log"></ul>
+<div id="stage"></div>
+<script src="fakes.js"></script>
+<script>
+(function () {
+  "use strict";
+  const F = window.GLFakes;
+  const sleep = F.sleep;
+  const log = document.getElementById("log");
+  const stage = document.getElementById("stage");
+  const KEY = "gl.prefs";
+  let failures = 0, total = 0;
+
+  function ok(c, m) { if (!c) throw new Error(m || "assertion failed"); }
+  function eq(a, b, m) { if (a !== b) throw new Error((m || "values differ") + ": got " + JSON.stringify(a) + ", want " + JSON.stringify(b)); }
+
+  async function test(name, fn) {
+    total++;
+    const li = document.createElement("li");
+    try {
+      await fn();
+      li.className = "pass";
+      li.textContent = "PASS " + name;
+    } catch (e) {
+      failures++;
+      li.className = "fail";
+      li.textContent = "FAIL " + name + " -- " + (e && e.message ? e.message : e);
+    }
+    log.appendChild(li);
+  }
+
+  // The real storage of this page (shared with the iframes below: same origin).
+  function store(raw) {
+    try {
+      if (raw === null) localStorage.removeItem(KEY);
+      else localStorage.setItem(KEY, raw);
+    } catch (_) { throw new Error("localStorage is not usable in the test page"); }
+  }
+  const stored = () => localStorage.getItem(KEY);
+
+  // A fresh window with a freshly loaded prefs.js: what the app sees after a reload.
+  async function freshPrefs(setup) {
+    const iframe = document.createElement("iframe");
+    stage.appendChild(iframe);
+    const w = iframe.contentWindow;
+    if (setup) setup(w);
+    await new Promise((resolve, reject) => {
+      const s = w.document.createElement("script");
+      s.src = new URL("../prefs.js", location.href).href;
+      s.onload = resolve;
+      s.onerror = () => reject(new Error("prefs.js did not load"));
+      w.document.head.appendChild(s);
+    });
+    if (!w.GLPrefs) throw new Error("GLPrefs missing");
+    return { win: w, prefs: w.GLPrefs, done: () => iframe.remove() };
+  }
+  async function withPrefs(raw, fn, setup) {
+    store(raw);
+    const f = await freshPrefs(setup);
+    try { await fn(f.prefs, f); } finally { f.done(); store(null); }
+  }
+  function throwingStorage(w) {
+    Object.defineProperty(w, "localStorage", { configurable: true, get: function () { throw new Error("storage blocked"); } });
+  }
+
+  // The start page with fakes; o: make() options + width/height. prefRaw seeds gl.prefs first.
+  async function page(o, prefRaw) {
+    store(prefRaw === undefined ? null : prefRaw);
+    o = Object.assign({ host: stage, width: 360, height: 740, recents: [] }, o || {});
+    const p = await F.load(o);
+    p.$ = (id) => p.doc.getElementById(id);
+    p.q = (s) => p.doc.querySelector(s);
+    p.qa = (s) => Array.from(p.doc.querySelectorAll(s));
+    p.rect = (el) => el.getBoundingClientRect();
+    p.visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    p.click = async (el) => { el.click(); await sleep(40); };
+    p.openSettings = async () => {
+      await p.click(p.$("menu_btn"));
+      const item = p.qa("#menu button").find((b) => b.textContent === "Settings");
+      ok(item, "Settings item in the menu");
+      await p.click(item);
+    };
+    p.back = async () => { p.win.dispatchEvent(new p.win.PopStateEvent("popstate", { state: null })); await sleep(20); };
+    p.checked = () => p.qa("#settings [role=radio]").filter((b) => b.getAttribute("aria-checked") === "true").map((b) => b.textContent);
+    p.done = () => p.iframe.remove();
+    return p;
+  }
+  async function withPage(o, raw, fn) {
+    const p = await page(o, raw);
+    try { await fn(p); } finally { p.done(); store(null); }
+  }
+
+  async function run() {
+    // ---------------------------------------------------------------- GLPrefs
+    await test("nothing stored: pageDirection is vertical, all() has the defaults", () => withPrefs(null, async (g) => {
+      eq(g.get("pageDirection"), "vertical");
+      eq(JSON.stringify(g.all()), JSON.stringify({ pageDirection: "vertical" }));
+    }));
+
+    await test("set sideways, then a fresh read (reload) gives sideways", () => withPrefs(null, async (g) => {
+      eq(g.set("pageDirection", "sideways"), true);
+      eq(g.get("pageDirection"), "sideways");
+      eq(JSON.parse(stored()).pageDirection, "sideways", "stored as JSON under gl.prefs");
+      const again = await freshPrefs();
+      try { eq(again.prefs.get("pageDirection"), "sideways", "after reload"); } finally { again.done(); }
+      g.set("pageDirection", "vertical");
+      eq(g.get("pageDirection"), "vertical");
+    }));
+
+    await test("corrupt JSON in gl.prefs gives vertical (and the next set repairs it)", () => withPrefs("{not json", async (g) => {
+      eq(g.get("pageDirection"), "vertical");
+      g.set("pageDirection", "sideways");
+      eq(JSON.parse(stored()).pageDirection, "sideways");
+    }));
+
+    await test("stored values of the wrong shape give vertical", async () => {
+      for (const raw of ["null", "42", "\"sideways\"", "[]", "{}", "{\"pageDirection\":7}", "{\"pageDirection\":null}", "{\"pageDirection\":\"Sideways\"}"]) {
+        await withPrefs(raw, async (g) => { eq(g.get("pageDirection"), "vertical", raw); });
+      }
+    });
+
+    await test("unknown value (diagonal) in storage gives vertical; set() ignores it and unknown names", () => withPrefs("{\"pageDirection\":\"diagonal\"}", async (g) => {
+      eq(g.get("pageDirection"), "vertical");
+      eq(g.set("pageDirection", "diagonal"), false);
+      eq(g.get("pageDirection"), "vertical");
+      g.set("pageDirection", "sideways");
+      eq(g.set("pageDirection", "diagonal"), false);
+      eq(g.get("pageDirection"), "sideways", "a rejected value leaves the saved one alone");
+      eq(g.set("colour", "red"), false);
+      eq(g.get("colour"), undefined);
+      eq(JSON.stringify(g.all()), JSON.stringify({ pageDirection: "sideways" }), "no unknown keys");
+    }));
+
+    await test("unknown keys in storage are not returned by all()", () => withPrefs("{\"pageDirection\":\"sideways\",\"other\":1}", async (g) => {
+      eq(JSON.stringify(g.all()), JSON.stringify({ pageDirection: "sideways" }));
+    }));
+
+    await test("storage that throws on every access: still works in memory", () => withPrefs(null, async (g, f) => {
+      let threw = false;
+      try { void f.win.localStorage; } catch (_) { threw = true; }
+      ok(threw, "the fake storage really throws");
+      eq(g.get("pageDirection"), "vertical");
+      eq(g.set("pageDirection", "sideways"), true);
+      eq(g.get("pageDirection"), "sideways", "kept in memory");
+      eq(g.all().pageDirection, "sideways");
+      eq(g.set("pageDirection", "diagonal"), false);
+      eq(g.get("pageDirection"), "sideways");
+    }, throwingStorage));
+
+    await test("storage that reads but refuses writes: the choice still sticks for this run", () => withPrefs(null, async (g, f) => {
+      f.win.Storage.prototype.setItem = function () { throw new Error("quota"); };
+      g.set("pageDirection", "sideways");
+      eq(g.get("pageDirection"), "sideways");
+      eq(stored(), null, "nothing was written");
+    }));
+
+    // ---------------------------------------------------------------- Settings screen
+    await test("menu lists Settings above About; Settings opens a sheet titled Settings", () => withPage({}, null, async (p) => {
+      ok(!p.visible(p.$("settings")), "closed first");
+      await p.click(p.$("menu_btn"));
+      eq(p.qa("#menu button").map((b) => b.textContent).join("|"), "Settings|About");
+      await p.click(p.qa("#menu button")[0]);
+      ok(p.visible(p.$("settings")), "sheet open");
+      ok(!p.visible(p.$("about")), "About stays closed");
+      eq(p.q("#settings .bar h1").textContent, "Settings");
+      eq(p.win.getComputedStyle(p.q("#settings .bar")).backgroundColor, "rgb(27, 94, 32)");
+      const c = p.rect(p.$("settings_close"));
+      ok(c.width >= 48 && c.height >= 48, "close button " + c.width + "x" + c.height);
+    }));
+
+    await test("one row only: Page direction, its helper text, and a Vertical | Sideways control", () => withPage({}, null, async (p) => {
+      await p.openSettings();
+      eq(p.qa("#settings .setting").length, 1, "one setting row");
+      eq(p.q("#settings .setting h2").textContent, "Page direction");
+      eq(p.q("#settings .setting p").textContent, "How you swipe between pages.");
+      eq(p.qa("#settings .seg button").map((b) => b.textContent).join("|"), "Vertical|Sideways");
+      eq(p.qa("#settings button").length, 3, "close + two choices, nothing else");
+    }));
+
+    await test("at 360 px both choices are at least 48 px tall and nothing overflows", () => withPage({ width: 360 }, null, async (p) => {
+      await p.openSettings();
+      const bs = p.qa("#settings .seg button");
+      eq(bs.length, 2);
+      for (const b of bs) {
+        const r = p.rect(b);
+        ok(r.height >= 48, b.textContent + " is " + r.height + " px tall");
+        ok(r.width >= 48, b.textContent + " is " + r.width + " px wide");
+      }
+      const de = p.doc.documentElement;
+      ok(de.scrollWidth <= de.clientWidth, "scrollWidth " + de.scrollWidth);
+      for (const el of p.qa("#settings, #settings *")) {
+        const r = p.rect(el);
+        if (r.width === 0) continue;
+        ok(r.left >= -0.5 && r.right <= 360.5, el.tagName + "#" + el.id + " spans " + r.left + ".." + r.right);
+      }
+    }));
+
+    await test("nothing saved: Vertical is the selected choice", () => withPage({}, null, async (p) => {
+      await p.openSettings();
+      eq(p.checked().join("|"), "Vertical");
+    }));
+
+    await test("saved sideways: Sideways is the selected choice, and it looks selected", () => withPage({}, "{\"pageDirection\":\"sideways\"}", async (p) => {
+      await p.openSettings();
+      eq(p.checked().join("|"), "Sideways");
+      const on = p.win.getComputedStyle(p.$("dir_sideways")), off = p.win.getComputedStyle(p.$("dir_vertical"));
+      eq(on.backgroundColor, "rgb(46, 125, 50)");
+      ok(off.backgroundColor !== on.backgroundColor, "the other choice looks different");
+    }));
+
+    await test("corrupt saved prefs: the screen shows Vertical", () => withPage({}, "{oops", async (p) => {
+      await p.openSettings();
+      eq(p.checked().join("|"), "Vertical");
+    }));
+
+    await test("tapping Sideways updates GLPrefs and storage; tapping Vertical puts it back", () => withPage({}, null, async (p) => {
+      await p.openSettings();
+      await p.click(p.$("dir_sideways"));
+      eq(p.win.GLPrefs.get("pageDirection"), "sideways");
+      eq(JSON.parse(stored()).pageDirection, "sideways");
+      eq(p.checked().join("|"), "Sideways");
+      await p.click(p.$("dir_sideways"));
+      eq(p.win.GLPrefs.get("pageDirection"), "sideways", "tapping the selected one changes nothing");
+      await p.click(p.$("dir_vertical"));
+      eq(p.win.GLPrefs.get("pageDirection"), "vertical");
+      eq(p.checked().join("|"), "Vertical");
+    }));
+
+    await test("the choice is still shown when Settings is opened again", () => withPage({}, null, async (p) => {
+      await p.openSettings();
+      await p.click(p.$("dir_sideways"));
+      await p.click(p.$("settings_close"));
+      await p.openSettings();
+      eq(p.checked().join("|"), "Sideways");
+    }));
+
+    await test("Android Back (popstate) returns to the start screen", () => withPage({}, null, async (p) => {
+      await p.openSettings();
+      ok(p.visible(p.$("settings")), "open");
+      await p.back();
+      ok(!p.visible(p.$("settings")), "closed by Back");
+      ok(p.visible(p.$("start")) && p.visible(p.$("open_pdf")), "start screen visible");
+      await p.back();
+      ok(p.visible(p.$("start")), "a second Back with nothing open does nothing here");
+    }));
+
+    await test("a popstate that lands on the sheet's own entry keeps Settings open", () => withPage({}, null, async (p) => {
+      await p.openSettings();
+      p.win.dispatchEvent(new p.win.PopStateEvent("popstate", { state: { glSheet: 1 } }));
+      ok(p.visible(p.$("settings")), "still open");
+    }));
+
+    await test("the close button returns to the start screen and leaves the history clean", () => withPage({}, null, async (p) => {
+      await p.openSettings();
+      eq(p.fake.history.length, 2, "one entry pushed");
+      await p.click(p.$("settings_close"));
+      await sleep(20);
+      ok(!p.visible(p.$("settings")), "closed");
+      ok(p.visible(p.$("start")), "start visible");
+      eq(p.fake.history.length, 1, "entry popped again");
+    }));
+
+    await test("About still opens and closes after Settings was used", () => withPage({}, null, async (p) => {
+      await p.openSettings();
+      await p.back();
+      await p.click(p.$("menu_btn"));
+      await p.click(p.qa("#menu button")[1]);
+      ok(p.visible(p.$("about")) && !p.visible(p.$("settings")), "About open, Settings closed");
+      await p.back();
+      ok(!p.visible(p.$("about")), "About closed by Back");
+    }));
+
+    await test("sheet has an explicit background from the CSS token (so light and dark both work)", () => withPage({}, null, async (p) => {
+      await p.openSettings();
+      const bg = p.win.getComputedStyle(p.$("settings")).backgroundColor;
+      const tok = p.win.getComputedStyle(p.doc.documentElement).getPropertyValue("--bg").trim();
+      ok(tok.length > 0, "--bg token exists");
+      ok(bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent", "explicit background " + bg);
+    }));
+  }
+
+  run().then(() => {
+    document.getElementById("result").textContent = failures === 0 ? "ALL PASS" : "FAIL " + failures;
+    document.title = "settings tests: " + total + " cases";
+    const n = document.createElement("li");
+    n.textContent = "cases: " + total + ", failed: " + failures;
+    log.appendChild(n);
+  }, (e) => {
+    failures++;
+    const li = document.createElement("li");
+    li.className = "fail";
+    li.textContent = "HARNESS ERROR " + (e && e.stack ? e.stack : e);
+    log.appendChild(li);
+    document.getElementById("result").textContent = "FAIL " + failures;
+  });
+})();
+</script>
+</body>
+</html>

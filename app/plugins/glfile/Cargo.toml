@@ -1,0 +1,16 @@
+[package]
+name = "tauri-plugin-glfile"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Greenline local Tauri 2 mobile plugin: pick a PDF through Android's Storage Access Framework, hand back a detached fd"
+publish = false
+# `links` makes Cargo pass this crate's `cargo:android_library_path` to the app's build script as
+# DEP_TAURI_PLUGIN_GLFILE_ANDROID_LIBRARY_PATH; tauri-build then adds `android/` to the generated
+# Gradle project as `:tauri-plugin-glfile` (gen/android/tauri.settings.gradle, app/tauri.build.gradle.kts).
+links = "tauri-plugin-glfile"
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

@@ -1,0 +1,10 @@
+export ANDROID_HOME="$HOME/Android/Sdk"
+export NDK_HOME="$ANDROID_HOME/ndk/27.2.12479018"
+TC="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin"
+API=30
+export CC_aarch64_linux_android="$TC/aarch64-linux-android$API-clang"
+export CXX_aarch64_linux_android="$TC/aarch64-linux-android$API-clang++"
+export AR_aarch64_linux_android="$TC/llvm-ar"
+export RANLIB_aarch64_linux_android="$TC/llvm-ranlib"
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER="$CC_aarch64_linux_android"
+export BINDGEN_EXTRA_CLANG_ARGS_aarch64_linux_android="--sysroot=$TC/../sysroot"

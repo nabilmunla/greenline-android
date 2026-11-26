@@ -1,0 +1,10 @@
+[workspace]
+members = ["engine", "app/src-tauri"]
+# spike/ stays frozen as the record of the phase 1 measurements; it has its own Cargo.lock.
+exclude = ["spike"]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+strip = true

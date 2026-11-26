@@ -1,0 +1,9 @@
+target/
+corpus/
+dist/
+
+# Release signing material lives in ~/.greenline-keys/, never in the repo.
+*.jks
+*.keystore
+keystore.properties
+.greenline-keys/

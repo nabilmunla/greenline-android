@@ -1,0 +1,511 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>viewer tests</title>
+<style>
+  body { font: 14px/1.4 monospace; margin: 12px; }
+  .pass { color: #0a7d2c; }
+  .fail { color: #c00; font-weight: bold; }
+  #result { font-size: 20px; font-weight: bold; margin: 12px 0; }
+  #stage { position: absolute; left: -10000px; top: 0; }
+</style>
+</head>
+<body>
+<h3>Viewer page-direction tests (task PD.3: the real viewer.js, viewmath.js and prefs.js inside ../index.html, stub app, synthetic pages)</h3>
+<div id="result">RUNNING</div>
+<ul id="log"></ul>
+<div id="stage"></div>
+<script>
+// What this drives: the real viewer.js in an iframe of ../index.html (start.js left out) with a stub
+// window.__TAURI__ (open_picked, show_page, close_doc; the gl-image event), a stub fetch that returns
+// synthetic page images (page n is a flat colour with four tinted quadrants), and a fake clock: the
+// iframe's requestAnimationFrame and performance.now are replaced so every animation is stepped by the
+// test and mid-slide frames can be read back from the canvas. Pointer gestures are synthetic
+// PointerEvents on the canvas (setPointerCapture is a no-op there: a synthetic pointer id is not active).
+(function () {
+  "use strict";
+  const log = document.getElementById("log");
+  const stage = document.getElementById("stage");
+  let failures = 0, total = 0;
+
+  function ok(c, m) { if (!c) throw new Error(m || "assertion failed"); }
+  function eq(a, b, m) { if (a !== b) throw new Error((m || "values differ") + ": got " + JSON.stringify(a) + ", want " + JSON.stringify(b)); }
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  async function test(name, fn) {
+    total++;
+    const li = document.createElement("li");
+    try {
+      await fn();
+      li.className = "pass";
+      li.textContent = "PASS " + name;
+    } catch (e) {
+      failures++;
+      li.className = "fail";
+      li.textContent = "FAIL " + name + " -- " + (e && e.message ? e.message : e);
+    }
+    log.appendChild(li);
+  }
+
+  let cachedHtml = null;
+  function indexHtml() {
+    if (cachedHtml === null) {
+      const x = new XMLHttpRequest();
+      x.open("GET", "../index.html", false);
+      x.send();
+      cachedHtml = x.responseText;
+    }
+    return cachedHtml;
+  }
+
+  // Synthetic page images: 150 x 200 px for a 600 x 800 pt page. Red channel = page number, green =
+  // left/right half, blue = top/bottom half (so a pan is visible on a single flat-coloured page).
+  const IW = 150, IH = 200;
+  function pageImage(pg) {
+    const a = new Uint8ClampedArray(IW * IH * 4);
+    for (let y = 0; y < IH; y++) {
+      for (let x = 0; x < IW; x++) {
+        const i = (y * IW + x) * 4;
+        a[i] = 50 + 60 * pg;
+        a[i + 1] = x < IW / 2 ? 60 : 160;
+        a[i + 2] = y < IH / 2 ? 60 : 160;
+        a[i + 3] = 255;
+      }
+    }
+    return a.buffer;
+  }
+
+  // The stub app + fake clock the iframe reads through window.parent.__V.
+  function makeStub(pages) {
+    const V = { t: 1000, q: [], n: 0, errors: [], shown: [], listeners: {}, invokes: [] };
+    V.raf = (cb) => { V.q.push([++V.n, cb]); return V.n; };
+    V.caf = (id) => { V.q = V.q.filter((e) => e[0] !== id); };
+    V.now = () => V.t;
+    // Advance the fake clock by ms and run the frame callbacks that were waiting.
+    V.step = (ms) => { V.t += ms; const q = V.q; V.q = []; for (const e of q) e[1](V.t); };
+    V.invoke = (cmd, args) => {
+      V.invokes.push(cmd);
+      switch (cmd) {
+        case "open_picked":
+          return Promise.resolve({ doc: 1, pages: pages, open_ms: 5, size_mb: 1, seekable: true, kind: "pdf" });
+        case "show_page":
+          V.shown.push(args.page);
+          setTimeout(() => {
+            const f = V.listeners["gl-image"];
+            if (f) f({ payload: { doc: 1, page: args.page, kind: "fit", id: args.page + 1, pt_w: 600, pt_h: 800 } });
+          }, 0);
+          return Promise.resolve(true);
+        case "close_doc":
+        case "cancel":
+          return Promise.resolve(true);
+        default:
+          return Promise.reject(new Error("unknown command"));
+      }
+    };
+    V.tauri = {
+      core: { invoke: V.invoke, convertFileSrc: () => "http://gl.localhost/" },
+      event: { listen: (name, cb) => { V.listeners[name] = cb; return Promise.resolve(() => {}); } },
+    };
+    V.fetch = (url) => {
+      const m = /img\?id=(\d+)/.exec(String(url));
+      const none = { status: 204, headers: { get: () => null }, arrayBuffer: async () => new ArrayBuffer(0) };
+      if (!m) return Promise.resolve(none);
+      const buf = pageImage(+m[1] - 1);
+      return Promise.resolve({
+        status: 200,
+        headers: { get: (k) => (k === "X-Gl-W" ? String(IW) : k === "X-Gl-H" ? String(IH) : null) },
+        arrayBuffer: async () => buf,
+      });
+    };
+    return V;
+  }
+
+  const HEAD = "window.__TAURI__=parent.__V.tauri;window.fetch=parent.__V.fetch;" +
+    "window.requestAnimationFrame=parent.__V.raf;window.cancelAnimationFrame=parent.__V.caf;" +
+    "window.performance.now=parent.__V.now;" +
+    "history.pushState=function(){};history.back=function(){};" +
+    "window.addEventListener('error',function(e){parent.__V.errors.push('error: '+e.message);});" +
+    "window.addEventListener('unhandledrejection',function(e){parent.__V.errors.push('rejection: '+(e.reason&&e.reason.message||e.reason));});";
+
+  // Opens the viewer on a stub document. o: { dir: "vertical" | "sideways" | undefined (no saved pref),
+  // pages, width, height }. Resolves with the helpers once page 1 is on screen.
+  async function openViewer(o) {
+    o = o || {};
+    const V = makeStub(o.pages || 3);
+    window.__V = V;
+    try { localStorage.removeItem("gl.prefs"); } catch (_) { /* ignore */ }
+    const iframe = document.createElement("iframe");
+    iframe.style.cssText = "border:0;display:block;background:#888;width:" + (o.width || 360) + "px;height:" + (o.height || 740) + "px";
+    stage.appendChild(iframe);
+    const base = new URL("../", location.href).href;
+    const head = '<head><base href="' + base + '"><script>' + HEAD + "<\/script>";
+    const html = indexHtml().replace('<script src="start.js"><\/script>', "").replace("<head>", () => head);
+    const d = iframe.contentDocument;
+    d.open();
+    d.write(html);
+    d.close();
+    const w = iframe.contentWindow;
+    for (let i = 0; i < 150 && !(w.GLViewer && w.GLPrefs); i++) await sleep(20);
+    if (!(w.GLViewer && w.GLPrefs)) throw new Error("viewer.js did not load");
+    if (o.dir) w.GLPrefs.set("pageDirection", o.dir);
+    const p = { V, iframe, win: w, doc: w.document };
+    p.$ = (id) => w.document.getElementById(id);
+    p.canvas = p.$("canvas");
+    p.canvas.setPointerCapture = () => {};
+    p.ctx = p.canvas.getContext("2d");
+    p.done = () => iframe.remove();
+
+    // Colour at a CSS-px point of the canvas: "bg", or "p<page>" + "L|R" + "T|B" (the tinted quadrant).
+    p.px = (x, y) => {
+      V.step(0); // run a draw that is waiting
+      const dpr = w.devicePixelRatio || 1;
+      const c = p.ctx.getImageData(Math.round(x * dpr), Math.round(y * dpr), 1, 1).data;
+      if (Math.abs(c[0] - 58) < 4 && Math.abs(c[1] - 58) < 4 && Math.abs(c[2] - 58) < 4) return "bg";
+      return "p" + Math.round((c[0] - 50) / 60) + (c[1] < 110 ? "L" : "R") + (c[2] < 110 ? "T" : "B");
+    };
+    // Run frames (16 ms apart) until no animation is waiting.
+    p.idle = () => { for (let i = 0; i < 80; i++) { V.step(16); if (!V.q.length) break; } };
+    // Wait (real time) until page `pg` is drawn at the viewport centre-left, for the stub image to land.
+    p.shows = async (pg) => {
+      let c = "";
+      for (let i = 0; i < 100; i++) {
+        c = p.px(90, 250);
+        if (c.indexOf("p" + pg) === 0) return;
+        await sleep(10);
+      }
+      throw new Error("page " + pg + " never drawn (canvas shows " + c + ")");
+    };
+    p.page = () => w.GLViewer.current().page;
+
+    const ev = (type, x, y) => p.canvas.dispatchEvent(new w.PointerEvent(type, {
+      pointerId: 1, pointerType: "touch", isPrimary: true, bubbles: true, cancelable: true, clientX: x, clientY: y,
+    }));
+    p.down = (x, y) => ev("pointerdown", x, y);
+    p.move = (x, y, ms) => { V.t += ms === undefined ? 20 : ms; ev("pointermove", x, y); };
+    p.up = (x, y) => { V.t += 20; ev("pointerup", x, y); };
+    // A drag from a to b in `ms` of fake time (a swipe when it is long and quick enough).
+    p.drag = (a, b, ms) => {
+      ms = ms || 120;
+      const n = 6;
+      p.down(a[0], a[1]);
+      for (let i = 1; i <= n; i++) p.move(a[0] + (b[0] - a[0]) * i / n, a[1] + (b[1] - a[1]) * i / n, ms / n);
+      p.up(b[0], b[1]);
+    };
+    p.tap = (x, y) => { p.down(x, y); V.t += 40; ev("pointerup", x, y); };
+
+    await w.GLViewer.open({ kind: "picker" }, 0);
+    await p.shows(0);
+    return p;
+  }
+  async function withViewer(o, fn) {
+    const p = await openViewer(o);
+    try {
+      await fn(p);
+      eq(p.V.errors.join(" | "), "", "script errors in the page");
+    } finally { p.done(); }
+  }
+
+  // Rotation of a pill glyph, in degrees clockwise, from its computed transform.
+  function glyphDeg(p, id) {
+    const svg = p.$(id).querySelector("svg");
+    ok(svg, id + " has an svg chevron");
+    const t = p.win.getComputedStyle(svg).transform;
+    if (t === "none") return 0;
+    const m = /matrix\(([^)]+)\)/.exec(t);
+    ok(m, "unexpected transform " + t);
+    const v = m[1].split(",").map(Number);
+    return (Math.round(Math.atan2(v[1], v[0]) * 180 / Math.PI) + 360) % 360;
+  }
+
+  const UP = [180, 560], DOWN = [180, 160]; // vertical swipe: a finger from UP to DOWN's y moves up
+
+  async function run() {
+    // ---------------------------------------------------------------- vertical (the default)
+    await test("vertical (no saved pref): swipe up goes to page 2, glyphs are up / down", () => withViewer({}, async (p) => {
+      eq(p.$("v_prev").dataset.glyph, "up", "prev glyph");
+      eq(p.$("v_next").dataset.glyph, "down", "next glyph");
+      eq(p.page(), 0);
+      p.drag([180, 560], [180, 330]);
+      p.idle();
+      await p.shows(1);
+      eq(p.page(), 1, "page after swipe up");
+      eq(p.V.shown.join(","), "0,1");
+    }));
+
+    await test("vertical: a sideways swipe does nothing (and the page does not follow it)", () => withViewer({ dir: "vertical" }, async (p) => {
+      p.down(300, 400);
+      for (let i = 1; i <= 6; i++) p.move(300 - 30 * i, 400);
+      p.V.step(0);
+      eq(p.px(20, 320).charAt(0), "p", "page not moved sideways mid-drag (20,320): " + p.px(20, 320));
+      eq(p.px(340, 320).charAt(0), "p", "page not moved sideways mid-drag (340,320)");
+      eq(p.px(90, 560).charAt(0), "p", "page not moved up either: (90,560) still page");
+      eq(p.px(90, 140).charAt(0), "p", "and (90,140) still page");
+      p.up(120, 400);
+      p.idle();
+      await sleep(30);
+      eq(p.page(), 0, "page");
+      eq(p.V.shown.join(","), "0", "no show_page");
+      p.drag([100, 400], [300, 400]); // and to the right
+      p.idle();
+      eq(p.page(), 0, "page after right swipe");
+      eq(p.V.shown.join(","), "0", "no show_page after right swipe");
+    }));
+
+    await test("vertical: during the drag the page follows the finger up/down only (cross axis locked), then springs back at page 1", () => withViewer({ dir: "vertical" }, async (p) => {
+      eq(p.px(90, 160).charAt(0), "p", "page covers (90,160) at rest");
+      p.down(180, 300);
+      for (let i = 1; i <= 5; i++) p.move(180 + 12 * i, 300 + 30 * i); // dx 60, dy 150
+      eq(p.px(90, 270), "bg", "page top edge is at y 280 (150 px down): (90,270) is background");
+      eq(p.px(90, 290).charAt(0), "p", "and (90,290) is page");
+      eq(p.px(20, 320).charAt(0), "p", "page did not move sideways: (20,320) still page");
+      p.up(240, 450); // a swipe down on the first page: nothing before it
+      p.idle();
+      await sleep(30);
+      eq(p.page(), 0, "still page 1");
+      eq(p.V.shown.join(","), "0", "no show_page");
+      eq(p.px(90, 160).charAt(0), "p", "sprang back to rest");
+      eq(p.px(20, 320).charAt(0), "p", "sprang back to rest (x)");
+    }));
+
+    await test("vertical: three pages walk 1 -> 2 -> 3, stay on 3 when swiped up again, and come back down", () => withViewer({ dir: "vertical", pages: 3 }, async (p) => {
+      p.drag([180, 600], [180, 300]); p.idle(); await p.shows(1); eq(p.page(), 1);
+      p.drag([180, 600], [180, 300]); p.idle(); await p.shows(2); eq(p.page(), 2);
+      p.drag([180, 600], [180, 300]); p.idle(); await sleep(30);
+      eq(p.page(), 2, "last page stays");
+      eq(p.px(90, 160).charAt(0), "p", "last page sprang back");
+      eq(p.V.shown.join(","), "0,1,2", "no extra show_page");
+      p.drag([180, 200], [180, 500]); p.idle();
+      eq(p.page(), 1, "swipe down goes to the previous page");
+      await p.shows(1);
+    }));
+
+    await test("vertical: a single-page file springs back on both swipes", () => withViewer({ dir: "vertical", pages: 1 }, async (p) => {
+      p.drag([180, 600], [180, 300]); p.idle();
+      p.drag([180, 200], [180, 500]); p.idle();
+      await sleep(30);
+      eq(p.page(), 0);
+      eq(p.V.shown.join(","), "0");
+      eq(p.px(90, 160).charAt(0), "p", "back at rest");
+    }));
+
+    await test("vertical: swipe back to a page seen before is instant and slides in from the top", () => withViewer({ dir: "vertical" }, async (p) => {
+      p.drag([180, 600], [180, 300]); p.idle(); await p.shows(1);
+      p.drag([180, 200], [180, 500]); // swipe down -> previous
+      p.V.step(80); // half way through the 160 ms slide: ease-out puts it 87 % of the way
+      eq(p.px(340, 320).charAt(0) + p.px(340, 320).charAt(1), "p0", "page 1 slides down from above and covers (340,320)");
+      eq(p.px(180, 700), "bg", "nothing at the bottom");
+      p.idle();
+      eq(p.page(), 0, "page");
+      eq(p.px(90, 250).slice(0, 2), "p0", "page 1 is drawn at once (no wait for the engine)");
+    }));
+
+    // ---------------------------------------------------------------- sideways
+    await test("sideways: swipe left goes to page 2, swipe right comes back, glyphs are left / right", () => withViewer({ dir: "sideways" }, async (p) => {
+      eq(p.$("v_prev").dataset.glyph, "left");
+      eq(p.$("v_next").dataset.glyph, "right");
+      p.drag([300, 400], [100, 400]); p.idle(); await p.shows(1);
+      eq(p.page(), 1, "after swipe left");
+      p.drag([100, 400], [300, 400]); p.idle();
+      eq(p.page(), 0, "after swipe right");
+      await p.shows(0);
+    }));
+
+    await test("sideways: vertical swipes do nothing, the page follows the finger sideways only, page 1 swipe right springs back", () => withViewer({ dir: "sideways" }, async (p) => {
+      p.drag([180, 600], [180, 300]); p.idle();
+      p.drag([180, 200], [180, 500]); p.idle();
+      await sleep(30);
+      eq(p.page(), 0);
+      eq(p.V.shown.join(","), "0");
+      p.down(100, 300);
+      for (let i = 1; i <= 5; i++) p.move(100 + 30 * i, 300 + 8 * i); // dx 150, dy 40
+      eq(p.px(140, 320), "bg", "page left edge is at x 150 (150 px right): (140,320) is background");
+      eq(p.px(160, 320).charAt(0), "p", "and (160,320) is page");
+      eq(p.px(200, 150).charAt(0), "p", "page did not move vertically: (200,150) still page");
+      p.up(250, 340);
+      p.idle();
+      await sleep(30);
+      eq(p.page(), 0);
+      eq(p.px(20, 320).charAt(0), "p", "sprang back");
+    }));
+
+    await test("sideways: swipe back slides in from the left (today's behaviour)", () => withViewer({ dir: "sideways" }, async (p) => {
+      p.drag([300, 400], [100, 400]); p.idle(); await p.shows(1);
+      p.drag([100, 400], [300, 400]);
+      p.V.step(80);
+      eq(p.px(100, 320).slice(0, 2), "p0", "page 1 slides in from the left");
+      eq(p.px(340, 320).slice(0, 2), "p1", "page 2 is leaving to the right");
+      p.idle();
+      eq(p.page(), 0);
+      eq(p.px(90, 250).slice(0, 2), "p0", "instant");
+    }));
+
+    // ---------------------------------------------------------------- pill
+    for (const mode of ["vertical", "sideways"]) {
+      await test(mode + ": pill buttons are >= 48 px at 360 px wide, keep their labels, and show the mode's glyphs", () => withViewer({ dir: mode, width: 360 }, async (p) => {
+        const prev = p.$("v_prev"), next = p.$("v_next");
+        for (const b of [prev, next]) {
+          const r = b.getBoundingClientRect();
+          ok(r.width >= 47.5 && r.height >= 47.5, b.id + " is " + r.width + " x " + r.height);
+          ok(r.left >= 0 && r.right <= 360.5, b.id + " inside the screen");
+        }
+        eq(prev.getAttribute("aria-label"), "Previous page");
+        eq(next.getAttribute("aria-label"), "Next page");
+        const pr = prev.getBoundingClientRect(), nr = next.getBoundingClientRect(), gr = p.$("pageno").getBoundingClientRect();
+        ok(pr.right <= gr.left && gr.right <= nr.left, "order: previous, page number, next");
+        if (mode === "vertical") {
+          eq(prev.dataset.glyph, "up"); eq(next.dataset.glyph, "down");
+          eq(glyphDeg(p, "v_prev"), 90, "prev chevron points up");
+          eq(glyphDeg(p, "v_next"), 270, "next chevron points down");
+        } else {
+          eq(prev.dataset.glyph, "left"); eq(next.dataset.glyph, "right");
+          eq(glyphDeg(p, "v_prev"), 0, "prev chevron points left");
+          eq(glyphDeg(p, "v_next"), 180, "next chevron points right");
+        }
+        const de = p.doc.documentElement;
+        ok(de.scrollWidth <= de.clientWidth, "no horizontal scroll");
+        const c = (b) => { const r = b.getBoundingClientRect(); return p.doc.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); };
+        eq(c(prev), prev, "a tap on the glyph hits the button");
+        eq(c(next), next, "a tap on the glyph hits the button");
+      }));
+    }
+
+    await test("vertical: next / previous buttons slide up / down (the page leaves upward), then show the page", () => withViewer({ dir: "vertical" }, async (p) => {
+      p.$("v_next").click();
+      p.V.step(80);
+      eq(p.px(20, 320), "bg", "page left upward: (20,320) is background");
+      eq(p.px(90, 250), "bg", "and (90,250)");
+      p.idle(); await p.shows(1);
+      eq(p.page(), 1);
+      p.$("v_prev").click();
+      p.V.step(80);
+      eq(p.px(340, 320).slice(0, 2), "p0", "previous page comes in from above");
+      p.idle();
+      eq(p.page(), 0);
+      ok(p.$("v_prev").disabled, "previous disabled on page 1");
+    }));
+
+    await test("sideways: next button slides left; two quick taps count as two pages", () => withViewer({ dir: "sideways" }, async (p) => {
+      p.$("v_next").click();
+      p.V.step(80);
+      eq(p.px(20, 320).charAt(0), "p", "page is leaving to the left: (20,320) still page");
+      eq(p.px(180, 320), "bg", "(180,320) is background");
+      p.idle(); await p.shows(1);
+      eq(p.page(), 1);
+      p.$("v_prev").click();
+      p.V.step(40);
+      p.$("v_prev").click(); // second tap before the first slide ended: counts from the page it will show
+      eq(p.page(), 1, "still on page 2 until the slide ends");
+      p.idle();
+      eq(p.page(), 0, "went back one page (page 1 is the first)");
+      p.$("v_next").click(); p.V.step(30);
+      p.$("v_next").click(); p.V.step(30);
+      p.idle(); await p.shows(2);
+      eq(p.page(), 2, "two quick next taps reach page 3");
+    }));
+
+    await test("jump to page: slides along the mode's axis and lands on the page", async () => {
+      for (const mode of ["vertical", "sideways"]) {
+        await withViewer({ dir: mode }, async (p) => {
+          p.$("pageno").click();
+          p.$("jump_n").value = "3";
+          p.$("jump").dispatchEvent(new p.win.Event("submit", { cancelable: true }));
+          p.V.step(80);
+          const gone = p.px(20, 320);
+          if (mode === "vertical") eq(gone, "bg", "vertical: page left upward");
+          else eq(gone.charAt(0), "p", "sideways: page leaving to the left still covers (20,320)");
+          p.idle(); await p.shows(2);
+          eq(p.page(), 2, mode + " lands on page 3");
+        });
+      }
+    });
+
+    // ---------------------------------------------------------------- zoomed
+    for (const mode of ["vertical", "sideways"]) {
+      await test(mode + ": zoomed in, drags pan every way and never change page, even against a page edge", () => withViewer({ dir: mode }, async (p) => {
+        p.tap(180, 370);
+        p.V.t += 100;
+        p.tap(180, 370); // double tap: zoom to 400 %
+        p.idle();
+        eq(p.px(150, 300), "p0LT", "zoomed: quadrants around the tap");
+        eq(p.px(210, 300), "p0RT");
+        eq(p.px(150, 440), "p0LB");
+        p.drag([100, 370], [200, 370], 400); // finger right: content moves right
+        p.idle();
+        eq(p.px(210, 300), "p0LT", "panned sideways by dragging right");
+        p.drag([100, 300], [100, 400], 400); // finger down: content moves down
+        p.idle();
+        eq(p.px(150, 440), "p0LT", "panned vertically by dragging down");
+        // Hard, fast drags every direction, many times: far past every page edge.
+        for (let i = 0; i < 4; i++) {
+          p.drag([180, 100], [180, 700], 100); p.idle();   // down, to the top edge
+          p.drag([180, 700], [180, 100], 100); p.idle();   // up
+          p.drag([40, 400], [340, 400], 100); p.idle();    // right
+          p.drag([340, 400], [40, 400], 100); p.idle();    // left
+        }
+        p.drag([180, 100], [180, 700], 80); p.idle();      // and finish at the top edge, swiping down
+        p.drag([180, 700], [180, 100], 80); p.idle();
+        await sleep(30);
+        eq(p.page(), 0, "still on page 1");
+        eq(p.V.shown.join(","), "0", "no page change requested");
+        // At fit again, the mode's swipe works.
+        p.$("v_fit").click(); p.idle();
+        if (mode === "vertical") p.drag([180, 600], [180, 300]); else p.drag([300, 400], [100, 400]);
+        p.idle(); await p.shows(1);
+        eq(p.page(), 1, "back at fit, the swipe changes page");
+      }));
+    }
+
+    // ---------------------------------------------------------------- pref read on every show
+    await test("the pref is read each time the viewer is shown (resume), not once; no GLPrefs means vertical", () => withViewer({ dir: "vertical" }, async (p) => {
+      eq(p.$("v_next").dataset.glyph, "down");
+      p.win.GLPrefs.set("pageDirection", "sideways");
+      ok(p.win.GLViewer.resume(), "resume");
+      eq(p.$("v_prev").dataset.glyph, "left", "glyph after resume");
+      eq(p.$("v_next").dataset.glyph, "right");
+      p.drag([180, 600], [180, 300]); p.idle(); await sleep(30);
+      eq(p.page(), 0, "a vertical swipe no longer changes page");
+      p.drag([300, 400], [100, 400]); p.idle(); await p.shows(1);
+      eq(p.page(), 1, "a sideways swipe does");
+      p.win.GLPrefs.set("pageDirection", "vertical");
+      p.win.GLViewer.resume();
+      eq(p.$("v_next").dataset.glyph, "down");
+      p.win.GLPrefs.set("pageDirection", "sideways");
+      p.win.GLViewer.resume();
+      delete p.win.GLPrefs;
+      eq(typeof p.win.GLPrefs, "undefined", "GLPrefs is gone");
+      p.win.GLViewer.resume();
+      eq(p.$("v_next").dataset.glyph, "down", "missing GLPrefs falls back to vertical");
+      p.drag([180, 600], [180, 300]); p.idle(); await p.shows(2);
+      eq(p.page(), 2, "and a vertical swipe works");
+    }));
+
+    await test("a page that sits half way through a slide is not left on screen after the direction changes", () => withViewer({ dir: "vertical" }, async (p) => {
+      p.drag([180, 600], [180, 300]); // slide-out starts
+      p.V.step(40);
+      p.win.GLPrefs.set("pageDirection", "sideways");
+      p.win.GLViewer.resume();
+      p.idle();
+      await sleep(30);
+      eq(p.px(90, 250).slice(0, 2), "p0", "page 1 is back at rest");
+    }));
+  }
+
+  run().then(() => {
+    document.getElementById("result").textContent = failures === 0 ? "ALL PASS" : "FAIL " + failures;
+    document.title = "viewer tests: " + total + " cases";
+    const n = document.createElement("li");
+    n.textContent = total + " cases";
+    log.appendChild(n);
+  }, (e) => {
+    failures++;
+    const li = document.createElement("li");
+    li.className = "fail";
+    li.textContent = "HARNESS ERROR " + (e && e.stack ? e.stack : e);
+    log.appendChild(li);
+    document.getElementById("result").textContent = "FAIL " + failures;
+  });
+})();
+</script>
+</body>
+</html>

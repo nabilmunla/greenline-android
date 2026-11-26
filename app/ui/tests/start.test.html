@@ -1,0 +1,563 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>start screen tests</title>
+<style>
+  body { font: 14px/1.4 monospace; margin: 12px; }
+  .pass { color: #0a7d2c; }
+  .fail { color: #c00; font-weight: bold; }
+  #result { font-size: 20px; font-weight: bold; margin: 12px 0; }
+  #stage { position: absolute; left: -10000px; top: 0; }
+</style>
+</head>
+<body>
+<h3>Start screen tests (app/ui/start.js inside ../index.html, fake app and viewer, synthetic names)</h3>
+<div id="result">RUNNING</div>
+<ul id="log"></ul>
+<div id="stage"></div>
+<script src="fakes.js"></script>
+<script>
+(function () {
+  "use strict";
+  const F = window.GLFakes;
+  const sleep = F.sleep;
+  const log = document.getElementById("log");
+  const stage = document.getElementById("stage");
+  let failures = 0, total = 0;
+
+  function ok(c, m) { if (!c) throw new Error(m || "assertion failed"); }
+  function eq(a, b, m) { if (a !== b) throw new Error((m || "values differ") + ": got " + JSON.stringify(a) + ", want " + JSON.stringify(b)); }
+
+  async function test(name, fn) {
+    total++;
+    const li = document.createElement("li");
+    try {
+      await fn();
+      li.className = "pass";
+      li.textContent = "PASS " + name;
+    } catch (e) {
+      failures++;
+      li.className = "fail";
+      li.textContent = "FAIL " + name + " -- " + (e && e.message ? e.message : e);
+    }
+    log.appendChild(li);
+  }
+
+  // Loads the page with fakes; clears any remembered dismissal first. o: make() options + width/height.
+  async function page(o) {
+    try { localStorage.removeItem("gl.defaultCard.dismissed"); } catch (_) { /* ignore */ }
+    o = Object.assign({ host: stage }, o || {});
+    const p = await F.load(o);
+    p.$ = (id) => p.doc.getElementById(id);
+    p.q = (s) => p.doc.querySelector(s);
+    p.qa = (s) => Array.from(p.doc.querySelectorAll(s));
+    p.rect = (el) => el.getBoundingClientRect();
+    p.visible = (el) => { const r = el.getBoundingClientRect(); return r.width > 0 && r.height > 0; };
+    p.click = async (el) => { el.click(); await sleep(40); };
+    p.rows = () => p.qa("#rlist .row");
+    p.lastOpen = () => p.fake.calls.open[p.fake.calls.open.length - 1];
+    p.cmds = (c) => p.fake.calls.invoke.filter((x) => x.cmd === c);
+    p.done = () => p.iframe.remove();
+    return p;
+  }
+  async function withPage(o, fn) {
+    const p = await page(o);
+    try { await fn(p); } finally { p.done(); }
+  }
+
+  const NOW = Date.now();
+  const R = (n) => F.recents(n, NOW);
+  const LONG = "Sample drawing 99 - Ground floor general arrangement plan with a very long title that cannot fit on one line.pdf";
+
+  async function run() {
+    // ---------------------------------------------------------------- empty state
+    await test("empty state: help line shown, no Continue, no Recent", () => withPage({ recents: [] }, async (p) => {
+      ok(p.visible(p.$("empty")), "help line visible");
+      eq(p.$("empty").textContent, "Open a drawing to get started. PDFs you open will show up here.");
+      ok(p.$("contsec").hidden && !p.visible(p.$("contsec")), "Continue hidden");
+      ok(!p.visible(p.$("recsec")), "Recent hidden");
+      eq(p.rows().length, 0);
+    }));
+
+    await test("Open PDF button: 56 px tall, full width of the column, 16 px above the bottom, green", () => withPage({ recents: [] }, async (p) => {
+      const b = p.$("open_pdf"), r = p.rect(b);
+      ok(Math.abs(r.height - 56) < 0.5, "height " + r.height);
+      ok(Math.abs(r.width - (412 - 32)) < 1, "width " + r.width);
+      ok(Math.abs((p.win.innerHeight - r.bottom) - 16) < 1, "bottom margin " + (p.win.innerHeight - r.bottom));
+      const cs = p.win.getComputedStyle(b);
+      eq(cs.backgroundColor, "rgb(46, 125, 50)");
+      eq(cs.color, "rgb(255, 255, 255)");
+      eq(p.win.getComputedStyle(p.$("obar")).position, "fixed");
+      eq(b.textContent, "Open PDF");
+    }));
+
+    await test("empty state: help line sits above the Open PDF button", () => withPage({ recents: [] }, async (p) => {
+      ok(p.rect(p.$("empty")).bottom <= p.rect(p.$("open_pdf")).top, "line above button");
+    }));
+
+    await test("Open PDF button opens the picker", () => withPage({ recents: [] }, async (p) => {
+      await p.click(p.$("open_pdf"));
+      eq(JSON.stringify(p.lastOpen().source), JSON.stringify({ kind: "picker" }));
+    }));
+
+    await test("header: green band, white Greenline title, 48 px menu button", () => withPage({ recents: [] }, async (p) => {
+      const bar = p.q("#start .bar"), h = p.q("#start .bar h1");
+      eq(p.win.getComputedStyle(bar).backgroundColor, "rgb(27, 94, 32)");
+      eq(h.textContent, "Greenline");
+      eq(p.win.getComputedStyle(h).color, "rgb(255, 255, 255)");
+      const m = p.rect(p.$("menu_btn"));
+      ok(m.width >= 48 && m.height >= 48, "menu button " + m.width + "x" + m.height);
+      ok(Math.abs(p.rect(bar).width - 412) < 1, "band spans the full width");
+    }));
+
+    await test("page background is explicit (not transparent)", () => withPage({ recents: [] }, async (p) => {
+      const c = p.win.getComputedStyle(p.doc.body).backgroundColor;
+      ok(c !== "rgba(0, 0, 0, 0)" && c !== "transparent", c);
+    }));
+
+    // ---------------------------------------------------------------- continue and recents
+    await test("1 recent: Continue card shows its name and page, list has 1 row", () => withPage({ recents: [{ id: "a1", name: "Sample drawing 01.pdf", pages: 12, last_page: 7, opened: NOW, thumb: null }] }, async (p) => {
+      ok(p.visible(p.$("cont")), "Continue visible");
+      eq(p.q("#cont .nm").textContent, "Sample drawing 01.pdf");
+      eq(p.q("#cont .meta").textContent, "Page 8 of 12");
+      eq(p.rows().length, 1);
+      ok(!p.visible(p.$("empty")), "no help line");
+    }));
+
+    await test("Continue card opens the newest recent at its last page", () => withPage({ recents: [{ id: "a1", name: "Sample drawing 01.pdf", pages: 12, last_page: 7, opened: NOW, thumb: null }] }, async (p) => {
+      await p.click(p.q("#cont .pick"));
+      const o = p.lastOpen();
+      eq(JSON.stringify(o.source), JSON.stringify({ kind: "recent", id: "a1" }));
+      eq(o.startPage, 7);
+    }));
+
+    await test("20 recents rendered, newest first", () => withPage({ recents: R(20) }, async (p) => {
+      eq(p.rows().length, 20);
+      eq(p.q("#rlist .row .nm").textContent, "Sample drawing 01.pdf");
+      eq(p.qa("#rlist .row .nm")[19].textContent, "Sample drawing 20.pdf");
+    }));
+
+    await test("more than 20 recents: only 20 shown", () => withPage({ recents: R(25) }, async (p) => {
+      eq(p.rows().length, 20);
+    }));
+
+    await test("tapping a row opens that file at its last page", () => withPage({ recents: R(6) }, async (p) => {
+      const row = p.rows()[2];
+      await p.click(row.querySelector(".pick"));
+      const o = p.lastOpen();
+      eq(o.source.kind, "recent");
+      eq(o.source.id, "id3");
+      eq(o.startPage, 2);
+    }));
+
+    await test("row shows thumbnail when given, a placeholder icon when not", () => withPage({ recents: R(3) }, async (p) => {
+      const rows = p.rows();
+      ok(rows[0].querySelector(".thumb img"), "row 1 has an image");
+      ok(rows[0].querySelector(".thumb img").src.indexOf("data:image/") === 0);
+      ok(!rows[1].querySelector(".thumb img") && rows[1].querySelector(".thumb svg"), "row 2 has the placeholder");
+      const t = p.rect(rows[0].querySelector(".thumb"));
+      ok(Math.abs(t.width - 56) < 0.5 && Math.abs(t.height - 56) < 0.5, "56 px thumbnail " + t.width + "x" + t.height);
+    }));
+
+    await test("a preview that fails to load becomes the placeholder icon (no broken image)", () => withPage({ recents: [
+      { id: "b1", name: "Sample drawing 01.pdf", pages: 2, last_page: 0, opened: NOW, thumb: "data:image/png;base64,AAAA" },
+    ] }, async (p) => {
+      for (let i = 0; i < 50 && p.rows()[0].querySelector(".thumb img"); i++) await new Promise((r) => setTimeout(r, 20));
+      const row = p.rows()[0];
+      ok(!row.querySelector(".thumb img"), "the broken image was removed");
+      ok(row.querySelector(".thumb svg"), "the placeholder is shown");
+    }));
+
+    await test("row dates: Today HH:MM, Yesterday, and day + month", () => withPage({ recents: [
+      { id: "t1", name: "Sample drawing 01.pdf", pages: 3, last_page: 0, opened: NOW, thumb: null },
+      { id: "t2", name: "Sample drawing 02.pdf", pages: 3, last_page: 0, opened: NOW - 86400000, thumb: null },
+      { id: "t3", name: "Sample drawing 03.pdf", pages: 3, last_page: 0, opened: NOW - 40 * 86400000, thumb: null },
+    ] }, async (p) => {
+      const m = p.qa("#rlist .meta").map((e) => e.textContent);
+      ok(/^Today \d\d:\d\d/.test(m[0]), m[0]);
+      ok(/^Yesterday/.test(m[1]), m[1]);
+      ok(/^\d{1,2} [A-Z][a-z]{2}( \d{4})?/.test(m[2]), m[2]);
+    }));
+
+    await test("formatDate: exact strings", () => withPage({ recents: [] }, async (p) => {
+      const f = p.win.GLStart.formatDate;
+      const now = new Date(2026, 10, 25, 18, 0).getTime();
+      eq(f(new Date(2026, 10, 25, 14, 5).getTime(), now), "Today 14:05");
+      eq(f(new Date(2026, 10, 24, 23, 59).getTime(), now), "Yesterday");
+      eq(f(new Date(2026, 10, 12, 9, 0).getTime(), now), "12 Nov");
+      eq(f(new Date(2025, 10, 12, 9, 0).getTime(), now), "12 Nov 2025");
+    }));
+
+    await test("remove: menu item calls remove_recent and the row disappears", () => withPage({ recents: R(4) }, async (p) => {
+      eq(p.rows().length, 4);
+      await p.click(p.rows()[1].querySelector(".iconbtn"));
+      ok(p.visible(p.$("menu")), "menu open");
+      const item = p.q("#menu button");
+      eq(item.textContent, "Remove from list");
+      await p.click(item);
+      const c = p.cmds("remove_recent");
+      eq(c.length, 1);
+      eq(c[0].args.id, "id2");
+      eq(p.rows().length, 3);
+      ok(!p.qa("#rlist .nm").some((e) => e.textContent === "Sample drawing 02 Level 1 plan.pdf"), "row 2 gone");
+      ok(!p.visible(p.$("menu")), "menu closed");
+    }));
+
+    await test("removing the last recent returns to the empty state", () => withPage({ recents: R(1) }, async (p) => {
+      await p.click(p.rows()[0].querySelector(".iconbtn"));
+      await p.click(p.q("#menu button"));
+      eq(p.rows().length, 0);
+      ok(p.visible(p.$("empty")), "help line back");
+      ok(!p.visible(p.$("contsec")), "Continue gone");
+    }));
+
+    await test("row menu closes when tapping outside, nothing removed", () => withPage({ recents: R(3) }, async (p) => {
+      await p.click(p.rows()[0].querySelector(".iconbtn"));
+      await p.click(p.$("menu_back"));
+      ok(!p.visible(p.$("menu")), "menu closed");
+      eq(p.cmds("remove_recent").length, 0);
+      eq(p.rows().length, 3);
+    }));
+
+    await test("Continue resumes the open document, with its current page", () => withPage({
+      recents: R(3), isOpen: true, current: { page: 4, pages: 9, recentId: "id2", incoming: false },
+    }, async (p) => {
+      eq(p.q("#cont .nm").textContent, "Sample drawing 02 Level 1 plan.pdf");
+      eq(p.q("#cont .meta").textContent, "Page 5 of 9");
+      await p.click(p.q("#cont .pick"));
+      eq(p.fake.calls.resume, 1);
+      ok(!p.fake.calls.open.some((o) => o.source.kind === "recent"), "no reopen");
+    }));
+
+    // ---------------------------------------------------------------- default-app card
+    await test("default card shown when the app is not the default", () => withPage({ recents: [], isDefault: false }, async (p) => {
+      ok(p.visible(p.$("defcard")), "visible");
+      eq(p.q("#defcard p").textContent, "Make Greenline your PDF app: open any PDF from Files, choose Greenline, then tap Always.");
+    }));
+
+    await test("default card hidden when the app is the default", () => withPage({ recents: [], isDefault: true }, async (p) => {
+      ok(!p.visible(p.$("defcard")), "hidden");
+    }));
+
+    await test("default card hidden when default_pdf_app fails", () => withPage({ recents: [], defaultReject: true }, async (p) => {
+      ok(!p.visible(p.$("defcard")), "hidden");
+    }));
+
+    await test("default card: dismiss hides it and it stays hidden after a refresh", () => withPage({ recents: R(2), isDefault: false }, async (p) => {
+      ok(p.visible(p.$("defcard")), "visible first");
+      await p.click(p.$("def_dismiss"));
+      ok(!p.visible(p.$("defcard")), "hidden after dismiss");
+      await p.win.GLStart.refresh();
+      ok(!p.visible(p.$("defcard")), "still hidden after refresh");
+      let stored = null;
+      try { stored = p.win.localStorage.getItem("gl.defaultCard.dismissed"); } catch (_) { stored = "1"; }
+      eq(stored, "1", "remembered");
+    }));
+
+    // ---------------------------------------------------------------- incoming files
+    await test("GLViewer.open({kind:'incoming'}) is called once on load", () => withPage({ recents: [] }, async (p) => {
+      const inc = p.fake.calls.open.filter((o) => o.source.kind === "incoming");
+      eq(inc.length, 1);
+      eq(JSON.stringify(inc[0].source), JSON.stringify({ kind: "incoming" }));
+      ok(!p.visible(p.$("smsg")), "E_NONE is quiet");
+    }));
+
+    await test("incoming is checked again when the page becomes visible", () => withPage({ recents: [] }, async (p) => {
+      Object.defineProperty(p.doc, "visibilityState", { get: () => "visible", configurable: true });
+      p.doc.dispatchEvent(new p.win.Event("visibilitychange"));
+      await sleep(60);
+      eq(p.fake.calls.open.filter((o) => o.source.kind === "incoming").length, 2);
+      ok(p.cmds("list_recents").length >= 2, "list refreshed too");
+    }));
+
+    await test("incoming is not checked when the page becomes hidden", () => withPage({ recents: [] }, async (p) => {
+      Object.defineProperty(p.doc, "visibilityState", { get: () => "hidden", configurable: true });
+      p.doc.dispatchEvent(new p.win.Event("visibilitychange"));
+      await sleep(60);
+      eq(p.fake.calls.open.filter((o) => o.source.kind === "incoming").length, 1);
+    }));
+
+    await test("the gl-incoming event triggers an incoming check", () => withPage({ recents: [] }, async (p) => {
+      ok(p.fake.calls.listen.indexOf("gl-incoming") >= 0, "listener registered");
+      p.fake.st.listeners["gl-incoming"]({});
+      await sleep(60);
+      eq(p.fake.calls.open.filter((o) => o.source.kind === "incoming").length, 2);
+    }));
+
+    await test("incoming error shows a friendly message", () => withPage({
+      recents: [], open: (s) => (s.kind === "incoming" ? { error: "E_OPEN_FAILED" } : { pages: 1 }),
+    }, async (p) => {
+      ok(p.visible(p.$("smsg")), "message visible");
+      eq(p.$("smsg_t").textContent, "Couldn't open this PDF.");
+    }));
+
+    await test("leaving the viewer refreshes the list; a file from another app moves the app to the back", () => withPage({
+      recents: R(2), isOpen: true, current: { page: 0, pages: 3, recentId: "id1", incoming: true },
+    }, async (p) => {
+      eq(p.fake.st.exitCbs.length, 1, "onExit registered");
+      const before = p.cmds("list_recents").length;
+      p.fake.st.exitCbs[0]();
+      await sleep(60);
+      ok(p.cmds("list_recents").length > before, "list refreshed");
+      eq(p.cmds("move_to_back").length, 1);
+    }));
+
+    await test("leaving the viewer for a file opened here does not move to the back", () => withPage({
+      recents: R(2), isOpen: true, current: { page: 0, pages: 3, recentId: "id1", incoming: false },
+    }, async (p) => {
+      p.fake.st.exitCbs[0]();
+      await sleep(60);
+      eq(p.cmds("move_to_back").length, 0);
+    }));
+
+    // ---------------------------------------------------------------- errors
+    await test("E_NO_PERMISSION: friendly message and a Remove from list button that works", () => withPage({
+      recents: R(3), open: (s) => (s.kind === "recent" ? { error: "E_NO_PERMISSION" } : { error: "E_NONE" }),
+    }, async (p) => {
+      await p.click(p.rows()[1].querySelector(".pick"));
+      ok(p.visible(p.$("smsg")), "message visible");
+      eq(p.$("smsg_t").textContent, "This file can't be reopened from here any more. Open it again from where it is stored.");
+      ok(p.visible(p.$("smsg_act")) && p.$("smsg_act").textContent === "Remove from list", "remove offered");
+      await p.click(p.$("smsg_act"));
+      eq(p.cmds("remove_recent")[0].args.id, "id2");
+      eq(p.rows().length, 2);
+      ok(!p.visible(p.$("smsg")), "message gone");
+    }));
+
+    await test("E_NOT_SEEKABLE, E_PICK_OPEN_FAILED, E_OPEN_FAILED: Couldn't open this PDF.", async () => {
+      for (const code of ["E_NOT_SEEKABLE", "E_PICK_OPEN_FAILED", "E_OPEN_FAILED"]) {
+        await withPage({ recents: [], open: (s) => (s.kind === "picker" ? { error: code } : { error: "E_NONE" }) }, async (p) => {
+          await p.click(p.$("open_pdf"));
+          eq(p.$("smsg_t").textContent, "Couldn't open this PDF.", code);
+          ok(!p.visible(p.$("smsg_act")), "no action for " + code);
+        });
+      }
+    });
+
+    await test("unknown error code is shown in the message", () => withPage({
+      recents: [], open: (s) => (s.kind === "picker" ? { error: "E_WHATEVER" } : { error: "E_NONE" }),
+    }, async (p) => {
+      await p.click(p.$("open_pdf"));
+      ok(p.$("smsg_t").textContent.indexOf("Couldn't open this PDF (code E_WHATEVER)") === 0, p.$("smsg_t").textContent);
+    }));
+
+    await test("E_PICK_CANCELLED and E_NONE are silent", async () => {
+      for (const code of ["E_PICK_CANCELLED", "E_NONE"]) {
+        await withPage({ recents: [], open: () => ({ error: code }) }, async (p) => {
+          await p.click(p.$("open_pdf"));
+          ok(!p.visible(p.$("smsg")), code + " shows nothing");
+        });
+      }
+    });
+
+    await test("message OK button dismisses it", () => withPage({ recents: [], open: () => ({ error: "E_OPEN_FAILED" }) }, async (p) => {
+      ok(p.visible(p.$("smsg")), "shown");
+      await p.click(p.$("smsg_ok"));
+      ok(!p.visible(p.$("smsg")), "dismissed");
+    }));
+
+    // ---------------------------------------------------------------- robustness
+    await test("list_recents failing gives the empty state, no crash", () => withPage({ listReject: true }, async (p) => {
+      eq(p.rows().length, 0);
+      ok(p.visible(p.$("empty")), "empty state");
+    }));
+
+    await test("works with no GLViewer at all", () => withPage({ recents: R(2), noViewer: true }, async (p) => {
+      eq(p.rows().length, 2);
+      await p.click(p.$("open_pdf"));
+      await p.click(p.rows()[0].querySelector(".pick"));
+      ok(!p.visible(p.$("smsg")), "no crash, no message");
+    }));
+
+    await test("malformed list entries are skipped", () => withPage({ recents: [
+      { id: "g1", name: "Sample drawing 01.pdf", pages: 2, last_page: 0, opened: NOW, thumb: "javascript:alert(1)" },
+      { name: "no id" }, null, { id: "g2", name: "Sample drawing 02.pdf", pages: null, last_page: null, opened: NOW, thumb: null },
+    ] }, async (p) => {
+      eq(p.rows().length, 2);
+      ok(!p.rows()[0].querySelector("img"), "non-data thumb ignored");
+      eq(p.qa("#rlist .meta")[1].textContent.indexOf("Page"), -1, "no page text when unknown");
+    }));
+
+    // ---------------------------------------------------------------- layout
+    const LONGS = Array.from({ length: 20 }, (_, i) => ({
+      id: "L" + i, name: LONG.replace("99", String(i)), pages: 30, last_page: 10, opened: NOW - i * 3600000, thumb: i % 2 ? null : F.thumb(i * 20),
+    }));
+
+    await test("long names ellipsize on one line and the row stays inside the column", () => withPage({ recents: LONGS.slice(0, 3) }, async (p) => {
+      const nm = p.q("#rlist .row .nm"), cs = p.win.getComputedStyle(nm);
+      ok(nm.scrollWidth > nm.clientWidth, "name overflows its box (" + nm.scrollWidth + " > " + nm.clientWidth + ")");
+      eq(cs.textOverflow, "ellipsis");
+      eq(cs.whiteSpace, "nowrap");
+      eq(cs.overflow, "hidden");
+      const col = p.rect(p.$("smain")), row = p.rect(p.rows()[0]);
+      ok(row.width <= col.width, "row " + row.width + " <= column " + col.width);
+      ok(row.height <= 80, "row stays one line high: " + row.height);
+      const cn = p.q("#cont .nm");
+      ok(cn.scrollWidth > cn.clientWidth, "Continue name ellipsizes too");
+    }));
+
+    for (const w of [360, 412]) {
+      await test("no element wider than the viewport, no horizontal scroll at " + w + " px", () => withPage({
+        recents: LONGS, isDefault: false, width: w, open: () => ({ error: "E_OPEN_FAILED" }),
+      }, async (p) => {
+        const de = p.doc.documentElement;
+        ok(de.scrollWidth <= de.clientWidth, "page scrollWidth " + de.scrollWidth + " > " + de.clientWidth);
+        for (const el of p.qa("#start, #start *")) {
+          const r = p.rect(el);
+          if (r.width === 0) continue;
+          ok(r.left >= -0.5 && r.right <= w + 0.5, el.tagName + "." + el.className + " spans " + r.left + ".." + r.right + " in " + w);
+        }
+      }));
+    }
+
+    await test("the column is centred and at most 560 px wide on a wide screen", () => withPage({ recents: R(3), width: 900 }, async (p) => {
+      const c = p.rect(p.$("smain"));
+      ok(c.width <= 560.5, "column width " + c.width);
+      ok(Math.abs(c.left - (900 - c.right)) < 1, "centred");
+      const b = p.rect(p.$("open_pdf"));
+      ok(b.width <= 530, "button is column wide, " + b.width);
+    }));
+
+    await test("every button and row is at least 48 px tall (rows 72), with a message and the default card showing", () => withPage({
+      recents: R(5), isDefault: false, open: () => ({ error: "E_NO_PERMISSION" }),
+    }, async (p) => {
+      await p.click(p.q("#cont .pick"));
+      const bad = [];
+      for (const b of p.qa("#start button")) {
+        if (!p.visible(b)) continue;
+        const r = p.rect(b);
+        if (r.height < 47.5 || r.width < 47.5) bad.push((b.id || b.className) + " " + r.width + "x" + r.height);
+      }
+      eq(bad.join("; "), "");
+      for (const row of p.rows()) ok(p.rect(row).height >= 72, "row height " + p.rect(row).height);
+      await p.click(p.rows()[0].querySelector(".iconbtn"));
+      for (const b of p.qa("#menu button")) ok(p.rect(b).height >= 48, "menu item " + p.rect(b).height);
+    }));
+
+    await test("visible buttons have at least 8 px between them", () => withPage({
+      recents: R(2), isDefault: false, height: 1100, open: () => ({ error: "E_NO_PERMISSION" }),
+    }, async (p) => {
+      await p.click(p.q("#cont .pick"));
+      const bs = p.qa("#start button").filter((b) => p.visible(b));
+      ok(bs.length >= 8, "found " + bs.length + " buttons");
+      for (let i = 0; i < bs.length; i++) for (let j = i + 1; j < bs.length; j++) {
+        const a = p.rect(bs[i]), b = p.rect(bs[j]);
+        const dx = Math.max(b.left - a.right, a.left - b.right, 0);
+        const dy = Math.max(b.top - a.bottom, a.top - b.bottom, 0);
+        ok(Math.max(dx, dy) >= 7.5,(bs[i].id || bs[i].className) + " / " + (bs[j].id || bs[j].className) + " gap " + Math.max(dx, dy));
+      }
+    }));
+
+    await test("the list can scroll clear of the Open PDF button (bottom padding)", () => withPage({ recents: LONGS, width: 360, height: 640 }, async (p) => {
+      p.win.scrollTo(0, 100000);
+      await sleep(30);
+      const last = p.rect(p.rows()[19]), btn = p.rect(p.$("open_pdf"));
+      ok(last.bottom <= btn.top, "last row ends at " + last.bottom + ", button starts at " + btn.top);
+    }));
+
+    await test("start screen text has none of: fd, seekable, RSS, MuPDF, Engine", () => withPage({
+      recents: R(8), isDefault: false, open: () => ({ error: "E_NO_PERMISSION" }),
+    }, async (p) => {
+      await p.click(p.q("#cont .pick"));
+      await p.click(p.$("menu_btn"));
+      const t = p.doc.body.innerText.toLowerCase();
+      ok(t.length > 100, "has text");
+      for (const w of ["fd", "seekable", "rss", "mupdf", "engine"]) eq(t.indexOf(w), -1, "found '" + w + "'");
+    }));
+
+    await test("neither the menu nor the list use text selection or the tap highlight", () => withPage({ recents: R(2) }, async (p) => {
+      for (const el of [p.q("#start"), p.q("#rlist .nm"), p.$("open_pdf")]) {
+        const s = p.win.getComputedStyle(el);
+        eq(s.userSelect, "none");
+      }
+    }));
+
+    // ---------------------------------------------------------------- About sheet
+    await test("menu has About; About opens a sheet with version and the MuPDF version", () => withPage({ recents: [] }, async (p) => {
+      ok(!p.visible(p.$("about")), "closed first");
+      await p.click(p.$("menu_btn"));
+      eq(p.qa("#menu button").map((b) => b.textContent).join("|"), "Settings|About");
+      await p.click(p.qa("#menu button")[1]);
+      ok(p.visible(p.$("about")), "sheet open");
+      ok(p.$("about").innerText.indexOf("Version 0.1.7") >= 0, "version");
+      eq(p.$("a_mupdf").textContent, "MuPDF 1.26.0 (verified)");
+      const c = p.rect(p.$("about_close"));
+      ok(c.width >= 48 && c.height >= 48, "close button " + c.width + "x" + c.height);
+    }));
+
+    await test("About: Developer is collapsed and holds Engine info, the probe numbers and Speed test", () => withPage({ recents: [] }, async (p) => {
+      await p.win.GLStart.openAbout();
+      const dev = p.$("dev");
+      ok(dev.tagName === "DETAILS" && !dev.open, "collapsed details");
+      for (const id of ["openout", "o_code", "o_pages", "o_seek", "o_kind", "o_size", "o_pick", "o_open", "o_auth", "d_info", "d_measure", "out", "mupdf", "page", "rss"]) {
+        ok(p.$(id) && dev.contains(p.$(id)), id + " inside Developer");
+      }
+      ok(p.$("openout").hidden, "probe dl starts hidden");
+      eq(p.$("d_measure").textContent, "Speed test");
+      eq(p.$("d_info").textContent, "Engine info");
+      ok(p.rect(dev.querySelector("summary")).height >= 48, "summary is a 48 px target");
+      dev.open = true;
+      await p.click(p.$("d_info"));
+      ok(!p.$("out").hidden, "engine dl shown");
+      eq(p.$("page").textContent, "4096 bytes");
+      eq(p.$("rss").textContent, "123.5 MB");
+      for (const id of ["d_info", "d_measure"]) ok(p.rect(p.$(id)).height >= 48, id + " >= 48 px");
+    }));
+
+    await test("About: Android Back (popstate) closes the sheet", () => withPage({ recents: [] }, async (p) => {
+      p.win.GLStart.openAbout();
+      ok(p.visible(p.$("about")), "open");
+      p.win.dispatchEvent(new p.win.PopStateEvent("popstate", { state: null }));
+      ok(!p.visible(p.$("about")), "closed by Back");
+    }));
+
+    await test("About: a popstate that lands on the sheet's own entry keeps it open (viewer closed on top)", () => withPage({ recents: [] }, async (p) => {
+      p.win.GLStart.openAbout();
+      p.win.dispatchEvent(new p.win.PopStateEvent("popstate", { state: { glSheet: 1 } }));
+      ok(p.visible(p.$("about")), "still open");
+    }));
+
+    await test("About: the close button closes the sheet; Back with the sheet closed does nothing", () => withPage({ recents: [] }, async (p) => {
+      p.win.GLStart.openAbout();
+      await p.click(p.$("about_close"));
+      ok(!p.visible(p.$("about")), "closed");
+      p.win.dispatchEvent(new p.win.PopStateEvent("popstate", { state: null }));
+      ok(!p.visible(p.$("about")), "still closed");
+      ok(p.visible(p.$("start")), "start screen visible");
+    }));
+
+    await test("About works at 360 px with no horizontal scroll", () => withPage({ recents: [], width: 360 }, async (p) => {
+      p.win.GLStart.openAbout();
+      p.$("dev").open = true;
+      p.$("openout").hidden = false;
+      for (const id of ["o_code", "o_pages", "o_seek", "o_kind", "o_size", "o_pick", "o_open", "o_auth"]) p.$(id).textContent = "Synthetic value 123456";
+      await sleep(30);
+      const de = p.doc.documentElement;
+      ok(de.scrollWidth <= de.clientWidth, "scrollWidth " + de.scrollWidth);
+      for (const el of p.qa("#about, #about *")) {
+        const r = p.rect(el);
+        if (r.width === 0) continue;
+        ok(r.left >= -0.5 && r.right <= 360.5, el.tagName + "#" + el.id + " spans " + r.left + ".." + r.right);
+      }
+    }));
+  }
+
+  run().then(() => {
+    document.getElementById("result").textContent = failures === 0 ? "ALL PASS" : "FAIL " + failures;
+    document.title = "start screen tests: " + total + " cases";
+    const n = document.createElement("li");
+    n.textContent = total + " cases";
+    log.appendChild(n);
+  }, (e) => {
+    failures++;
+    const li = document.createElement("li");
+    li.className = "fail";
+    li.textContent = "HARNESS ERROR " + (e && e.stack ? e.stack : e);
+    log.appendChild(li);
+    document.getElementById("result").textContent = "FAIL " + failures;
+  });
+})();
+</script>
+</body>
+</html>

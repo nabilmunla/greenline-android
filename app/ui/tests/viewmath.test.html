@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>viewmath tests</title>
+<style>
+  body { font: 14px/1.4 monospace; margin: 12px; }
+  .pass { color: #0a7d2c; }
+  .fail { color: #c00; font-weight: bold; }
+  #result { font-size: 20px; font-weight: bold; margin: 12px 0; }
+</style>
+</head>
+<body>
+<h3>GLMath tests (app/ui/viewmath.js)</h3>
+<div id="result">RUNNING</div>
+<ul id="log"></ul>
+<script src="../viewmath.js"></script>
+<script>
+(function () {
+  "use strict";
+  var M = window.GLMath;
+  var log = document.getElementById("log");
+  var failures = 0, total = 0;
+
+  function ok(cond, msg) { if (!cond) throw new Error(msg || "assertion failed"); }
+  function eq(a, b, msg) {
+    if (a !== b) throw new Error((msg || "eq") + ": got " + JSON.stringify(a) + ", want " + JSON.stringify(b));
+  }
+  function near(a, b, tol, msg) {
+    if (!(Math.abs(a - b) <= tol)) throw new Error((msg || "near") + ": got " + a + ", want " + b + " +-" + tol);
+  }
+  function test(name, fn) {
+    total++;
+    var li = document.createElement("li");
+    try { fn(); li.className = "pass"; li.textContent = "PASS " + name; }
+    catch (e) { failures++; li.className = "fail"; li.textContent = "FAIL " + name + " :: " + e.message; }
+    log.appendChild(li);
+  }
+
+  // ---- fixtures: US letter page, phone viewport 412x800 CSS px ----
+  var PT_W = 612, PT_H = 792, VW = 412, VH = 800, DPR = 2.625;
+  var FIT = M.fitScale(PT_W, PT_H, VW, VH);
+  var MAX = M.maxScale(DPR);
+  var LIM = { ptW: PT_W, ptH: PT_H, viewW: VW, viewH: VH, fit: FIT, max: MAX };
+  function pt(x, y) { return { x: x, y: y }; }
+  function fitView() { return M.clampOffset({ s: FIT, ox: 0, oy: 0 }, PT_W, PT_H, VW, VH); }
+
+  // gesture builders
+  function one(pts) { // pts: [[t,x,y], ...] first=down, last=up, middle=move
+    return pts.map(function (p, i) {
+      return { t: p[0], id: 1, x: p[1], y: p[2],
+        type: i === 0 ? "down" : (i === pts.length - 1 ? "up" : "move") };
+    });
+  }
+  var ST = { zoomed: false, lastTapT: null, lastTapX: 0, lastTapY: 0 };
+  function st(o) { var r = {}; for (var k in ST) r[k] = ST[k]; for (k in o) r[k] = o[k]; return r; }
+
+  // ---- fit / clamp scale ----
+  test("fitScale width-limited", function () {
+    near(M.fitScale(612, 792, 412, 2000), 412 / 612, 1e-12);
+  });
+  test("fitScale height-limited", function () {
+    near(M.fitScale(612, 792, 2000, 800), 800 / 792, 1e-12);
+  });
+  test("maxScale = 16 / dpr (1600 %, task 2c.2)", function () { near(M.maxScale(2), 8, 1e-12); near(M.maxScale(3), 16 / 3, 1e-12); });
+  test("clampScale below fit, inside, above max", function () {
+    eq(M.clampScale(0.1, 0.5, 2), 0.5);
+    eq(M.clampScale(1.2, 0.5, 2), 1.2);
+    eq(M.clampScale(9, 0.5, 2), 2);
+  });
+  test("clampScale degenerate max < fit -> fit", function () { eq(M.clampScale(1, 2, 1.5), 2); });
+  test("isZoomed threshold 5 %", function () {
+    ok(!M.isZoomed(FIT * 1.05, FIT), "exactly 1.05 not zoomed");
+    ok(M.isZoomed(FIT * 1.0501, FIT), "above 1.05 zoomed");
+  });
+
+  // ---- clampOffset ----
+  test("clampOffset centres page smaller than viewport (both axes)", function () {
+    var v = M.clampOffset({ s: 0.5, ox: 40, oy: -7 }, 200, 300, 412, 800);
+    // visible = 824 x 1600 pts; centre: (200-824)/2, (300-1600)/2
+    near(v.ox, (200 - 824) / 2, 1e-9);
+    near(v.oy, (300 - 1600) / 2, 1e-9);
+  });
+  test("clampOffset centred page sits mid-viewport in CSS px", function () {
+    var v = M.clampOffset({ s: 0.5, ox: 0, oy: 0 }, 200, 300, 412, 800);
+    near((0 - v.ox) * v.s, (412 - 200 * 0.5) / 2, 1e-9, "left margin");
+    near((0 - v.oy) * v.s, (800 - 300 * 0.5) / 2, 1e-9, "top margin");
+  });
+  test("clampOffset fit view of a letter page: centred on the short axis", function () {
+    var v = fitView();
+    near(v.ox, 0, 1e-9, "width-limited, ox 0");
+    ok(v.oy < 0, "oy negative (vertical margin)");
+    near((0 - v.oy) * FIT, (VH - PT_H * FIT) / 2, 1e-9);
+  });
+  test("clampOffset keeps viewport inside page when zoomed", function () {
+    var s = 1.5;
+    var lo = M.clampOffset({ s: s, ox: -50, oy: -50 }, PT_W, PT_H, VW, VH);
+    eq(lo.ox, 0); eq(lo.oy, 0);
+    var hi = M.clampOffset({ s: s, ox: 9999, oy: 9999 }, PT_W, PT_H, VW, VH);
+    near(hi.ox, PT_W - VW / s, 1e-9); near(hi.oy, PT_H - VH / s, 1e-9);
+  });
+  test("clampOffset leaves an in-range offset alone", function () {
+    var v = M.clampOffset({ s: 1.5, ox: 100, oy: 200 }, PT_W, PT_H, VW, VH);
+    eq(v.ox, 100); eq(v.oy, 200); eq(v.s, 1.5);
+  });
+  test("clampOffset mixed axes: wide viewport, tall zoomed page", function () {
+    // s=1: visible 1000 x 800 pts; page 612 wide (centre), 792... use 3000 tall (clamp)
+    var v = M.clampOffset({ s: 1, ox: 5, oy: 5000 }, 612, 3000, 1000, 800);
+    near(v.ox, (612 - 1000) / 2, 1e-9);
+    near(v.oy, 3000 - 800, 1e-9);
+  });
+
+  // ---- pinch ----
+  test("pinch doubling finger distance doubles scale", function () {
+    var v = M.pinch({ s: 1, ox: 0, oy: 0 }, pt(100, 100), pt(200, 100), pt(50, 100), pt(250, 100));
+    near(v.s, 2, 1e-12);
+  });
+  test("pinch keeps page point under midpoint (single step)", function () {
+    var v0 = { s: 0.8, ox: 33, oy: 71 };
+    var a0 = pt(150, 300), b0 = pt(250, 420), a1 = pt(120, 280), b1 = pt(300, 470);
+    var m0 = pt(200, 360), m1 = pt(210, 375);
+    var v1 = M.pinch(v0, a0, b0, a1, b1);
+    var X = v0.ox + m0.x / v0.s, Y = v0.oy + m0.y / v0.s;
+    near((X - v1.ox) * v1.s, m1.x, 1e-9, "x under new midpoint");
+    near((Y - v1.oy) * v1.s, m1.y, 1e-9, "y under new midpoint");
+  });
+  test("pinch with equal distance is a pure two-finger pan", function () {
+    var v0 = { s: 1.2, ox: 100, oy: 100 };
+    var v1 = M.pinch(v0, pt(100, 100), pt(200, 100), pt(130, 160), pt(230, 160));
+    near(v1.s, 1.2, 1e-12);
+    near(v1.ox, 100 - 30 / 1.2, 1e-9);
+    near(v1.oy, 100 - 60 / 1.2, 1e-9);
+  });
+  test("pinch coincident start fingers does not blow up", function () {
+    var v = M.pinch({ s: 1, ox: 0, oy: 0 }, pt(5, 5), pt(5, 5), pt(0, 0), pt(40, 0));
+    ok(isFinite(v.s) && isFinite(v.ox) && isFinite(v.oy));
+    eq(v.s, 1);
+  });
+
+  function driftRun(zoomIn) {
+    // 100 small steps, fingers move a little each step (distance ratio +-1.3 %,
+    // midpoint drifts), anchored page point is tracked step to step.
+    var v = zoomIn ? { s: FIT, ox: 0, oy: 0 } : { s: MAX, ox: 100, oy: 200 };
+    var maxDrift = 0;
+    var cx = 206, cy = 400, half = 60;
+    for (var i = 0; i < 100; i++) {
+      var k = zoomIn ? 1.013 : 1 / 1.013;
+      var mx0 = cx + i * 0.3, my0 = cy - i * 0.5;
+      var mx1 = cx + (i + 1) * 0.3, my1 = cy - (i + 1) * 0.5;
+      var h0 = half * Math.pow(k, i), h1 = half * Math.pow(k, i + 1);
+      // fingers on a tilted axis
+      var a0 = pt(mx0 - h0 * 0.8, my0 - h0 * 0.6), b0 = pt(mx0 + h0 * 0.8, my0 + h0 * 0.6);
+      var a1 = pt(mx1 - h1 * 0.8, my1 - h1 * 0.6), b1 = pt(mx1 + h1 * 0.8, my1 + h1 * 0.6);
+      var X = v.ox + mx0 / v.s, Y = v.oy + my0 / v.s;
+      v = M.pinch(v, a0, b0, a1, b1);
+      var dxp = (X - v.ox) * v.s - mx1, dyp = (Y - v.oy) * v.s - my1;
+      maxDrift = Math.max(maxDrift, Math.sqrt(dxp * dxp + dyp * dyp));
+    }
+    return { v: v, drift: maxDrift };
+  }
+  test("anchor drift < 0.5 px over 100 pinch-in steps", function () {
+    var r = driftRun(true);
+    ok(r.v.s > FIT * 3, "actually zoomed in a lot, s=" + r.v.s);
+    ok(r.drift < 0.5, "drift " + r.drift);
+  });
+  test("anchor drift < 0.5 px over 100 pinch-out steps", function () {
+    var r = driftRun(false);
+    ok(r.v.s < MAX / 3, "actually zoomed out a lot, s=" + r.v.s);
+    ok(r.drift < 0.5, "drift " + r.drift);
+  });
+  test("anchor drift < 0.5 px over 100 mixed in/out steps", function () {
+    var v = { s: 1, ox: 50, oy: 50 }, maxDrift = 0;
+    for (var i = 0; i < 100; i++) {
+      var r0 = 80, r1 = 80 * (1 + 0.02 * Math.sin(i / 7));
+      var m0 = pt(200 + 40 * Math.sin(i / 11), 400), m1 = pt(200 + 40 * Math.sin((i + 1) / 11), 400 + i * 0.2);
+      var a0 = pt(m0.x - r0, m0.y), b0 = pt(m0.x + r0, m0.y), a1 = pt(m1.x - r1, m1.y), b1 = pt(m1.x + r1, m1.y);
+      var X = v.ox + m0.x / v.s, Y = v.oy + m0.y / v.s;
+      v = M.pinch(v, a0, b0, a1, b1);
+      maxDrift = Math.max(maxDrift, Math.hypot ? Math.hypot((X - v.ox) * v.s - m1.x, (Y - v.oy) * v.s - m1.y) : 0);
+    }
+    ok(maxDrift < 0.5, "drift " + maxDrift);
+  });
+
+  // ---- pinchClamped ----
+  test("pinchClamped: scale always within [fit, max] over 300 random pinches", function () {
+    var seed = 12345;
+    function rnd() { seed = (seed * 1664525 + 1013904223) >>> 0; return seed / 4294967296; }
+    var v = fitView();
+    for (var i = 0; i < 300; i++) {
+      var d0 = 40 + rnd() * 300, d1 = d0 * (0.5 + rnd() * 1.5);   // big in/out jumps
+      var m0 = pt(rnd() * VW, rnd() * VH), m1 = pt(rnd() * VW, rnd() * VH);
+      v = M.pinchClamped(v, pt(m0.x - d0 / 2, m0.y), pt(m0.x + d0 / 2, m0.y),
+        pt(m1.x - d1 / 2, m1.y), pt(m1.x + d1 / 2, m1.y), LIM);
+      ok(v.s >= FIT - 1e-9 && v.s <= MAX + 1e-9, "step " + i + " s=" + v.s);
+    }
+  });
+  test("pinchClamped: pinch out past fit stops at fit and centres", function () {
+    var v = M.pinchClamped({ s: FIT * 1.2, ox: 20, oy: 30 }, pt(100, 400), pt(300, 400), pt(190, 400), pt(210, 400), LIM);
+    near(v.s, FIT, 1e-12);
+    var f = fitView();
+    near(v.ox, f.ox, 1e-9); near(v.oy, f.oy, 1e-9);
+  });
+  test("pinchClamped: pinch in past max stops at max and anchor holds", function () {
+    var v0 = { s: MAX * 0.98, ox: 200, oy: 100 };
+    var a0 = pt(150, 400), b0 = pt(250, 400), a1 = pt(50, 400), b1 = pt(350, 400);
+    var v = M.pinchClamped(v0, a0, b0, a1, b1, LIM);
+    near(v.s, MAX, 1e-12);
+    // anchor (page point under old midpoint 200,400) should be under new midpoint (200,400)
+    var X = v0.ox + 200 / v0.s, Y = v0.oy + 400 / v0.s;
+    near((X - v.ox) * v.s, 200, 1e-6, "anchor x kept");
+    near((Y - v.oy) * v.s, 400, 1e-6, "anchor y kept");
+  });
+  test("pinchClamped equals pinch when nothing needs clamping", function () {
+    var v0 = { s: FIT * 1.8, ox: 100, oy: 50 };   // offsets well inside the legal range
+    var args = [pt(150, 400), pt(250, 400), pt(145, 410), pt(255, 410)];
+    var a = M.pinch(v0, args[0], args[1], args[2], args[3]);
+    var b = M.pinchClamped(v0, args[0], args[1], args[2], args[3], LIM);
+    near(b.s, a.s, 1e-12); near(b.ox, a.ox, 1e-9); near(b.oy, a.oy, 1e-9);
+  });
+  test("pinchClamped: result offset always legal (viewport inside page or centred)", function () {
+    var v = M.pinchClamped({ s: FIT * 2, ox: 0, oy: 0 }, pt(100, 100), pt(200, 100), pt(400, 700), pt(600, 700), LIM);
+    var c = M.clampOffset(v, PT_W, PT_H, VW, VH);
+    near(v.ox, c.ox, 1e-9); near(v.oy, c.oy, 1e-9);
+  });
+
+  // ---- zoomAt ----
+  test("zoomAt keeps the tapped viewport point fixed", function () {
+    var v0 = { s: FIT, ox: 0, oy: -60 }, px = 300, py = 250;
+    var v1 = M.zoomAt(v0, 3, px, py);
+    eq(v1.s, 3);
+    var X = v0.ox + px / v0.s, Y = v0.oy + py / v0.s;
+    near((X - v1.ox) * v1.s, px, 1e-9); near((Y - v1.oy) * v1.s, py, 1e-9);
+  });
+  test("zoomAt then clamp stays inside page", function () {
+    var v = M.clampOffset(M.zoomAt(fitView(), MAX, 5, 5), PT_W, PT_H, VW, VH);
+    ok(v.ox >= 0 && v.oy >= 0 && v.ox <= PT_W - VW / MAX + 1e-9 && v.oy <= PT_H - VH / MAX + 1e-9);
+  });
+
+  // ---- chooseLevel ----
+  test("chooseLevel 0 when need <= fit image px/pt (boundary inclusive)", function () {
+    eq(M.chooseLevel(0.75, 2, [2, 4], 1.5), 0);       // need exactly 1.5
+    eq(M.chooseLevel(0.5, 2, [2, 4], 1.5), 0);
+  });
+  test("chooseLevel smallest level >= need", function () {
+    eq(M.chooseLevel(0.8, 2, [2, 4], 1.5), 2);        // need 1.6
+    eq(M.chooseLevel(1.0, 2, [2, 4], 1.5), 2);        // need exactly 2 -> 2
+    eq(M.chooseLevel(1.0001, 2, [2, 4], 1.5), 4);     // need just over 2 -> 4
+    eq(M.chooseLevel(2.0, 2, [2, 4], 1.5), 4);        // need exactly 4 -> 4
+  });
+  test("chooseLevel above top level returns the largest", function () {
+    eq(M.chooseLevel(2.5, 2, [2, 4], 1.5), 4);
+  });
+  test("chooseLevel defaults: levels [2,4], no fit arg -> never 0", function () {
+    eq(M.chooseLevel(0.1, 2), 2);
+    eq(M.chooseLevel(1.5, 2, undefined, 1.0), 4);
+  });
+  test("chooseLevel respects custom levels", function () {
+    eq(M.chooseLevel(1.0, 2, [1, 2, 3, 4], 0.5), 2);
+    eq(M.chooseLevel(1.2, 2, [1, 2, 3, 4], 0.5), 3);
+  });
+
+  // ---- visibleTiles ----
+  test("visibleTiles at fit shows the whole page: 3x4 tiles at level 4", function () {
+    var t = M.visibleTiles(fitView(), VW, VH, 4, PT_W, PT_H);
+    eq(t.length, 12);
+    ok(t.every(function (q) { return q.tx >= 0 && q.tx <= 2 && q.ty >= 0 && q.ty <= 3; }), "indices in range");
+  });
+  test("visibleTiles x0/y0 are tx*1024, ty*1024", function () {
+    var t = M.visibleTiles(fitView(), VW, VH, 4, PT_W, PT_H);
+    ok(t.every(function (q) { return q.x0 === q.tx * 1024 && q.y0 === q.ty * 1024; }));
+  });
+  test("visibleTiles level 2 whole page: 2x2", function () {
+    eq(M.visibleTiles(fitView(), VW, VH, 2, PT_W, PT_H).length, 4);
+  });
+  test("visibleTiles top-left zoomed view: 2 cols x 3 rows", function () {
+    var t = M.visibleTiles({ s: 1.5, ox: 0, oy: 0 }, VW, VH, 4, PT_W, PT_H);
+    eq(t.length, 6);
+    eq(Math.max.apply(null, t.map(function (q) { return q.tx; })), 1);
+    eq(Math.max.apply(null, t.map(function (q) { return q.ty; })), 2);
+  });
+  test("visibleTiles bottom-right clip: never beyond last tile", function () {
+    var s = 1.5;
+    var v = M.clampOffset({ s: s, ox: 99999, oy: 99999 }, PT_W, PT_H, VW, VH);
+    var t = M.visibleTiles(v, VW, VH, 4, PT_W, PT_H);
+    eq(t.length, 6);
+    ok(t.every(function (q) { return q.tx <= 2 && q.ty <= 3; }), "no tile past the page");
+    ok(t.some(function (q) { return q.tx === 2 && q.ty === 3 && q.x0 === 2048 && q.y0 === 3072; }), "has last tile");
+    eq(Math.min.apply(null, t.map(function (q) { return q.tx; })), 1);
+    eq(Math.min.apply(null, t.map(function (q) { return q.ty; })), 1);
+  });
+  test("visibleTiles view edge exactly on a tile boundary does not spill", function () {
+    // level 2, s=1, viewport 512 css px wide -> 1024 px; page 2000 pt wide
+    var t = M.visibleTiles({ s: 1, ox: 0, oy: 0 }, 512, 512, 2, 2000, 2000);
+    eq(t.length, 1);
+    eq(t[0].tx, 0); eq(t[0].ty, 0);
+  });
+  test("visibleTiles view starting on a boundary excludes the previous tile", function () {
+    var t = M.visibleTiles({ s: 1, ox: 512, oy: 0 }, 256, 256, 2, 2000, 2000);
+    eq(t.length, 1); eq(t[0].tx, 1);
+  });
+  test("visibleTiles page smaller than one tile: single tile", function () {
+    eq(M.visibleTiles({ s: 1, ox: -20, oy: -20 }, 400, 400, 2, 100, 100).length, 1);
+  });
+  test("visibleTiles view fully outside page -> empty", function () {
+    eq(M.visibleTiles({ s: 1, ox: 5000, oy: 0 }, 400, 400, 2, 612, 792).length, 0);
+  });
+  test("visibleTiles honours a custom tile size", function () {
+    var t = M.visibleTiles({ s: 1, ox: 0, oy: 0 }, 400, 400, 2, 612, 792, 256);
+    // 800 x 800 px visible at level 2 with 256 tiles: 4 x 4
+    eq(t.length, 16);
+  });
+
+  // ---- classify: tap / double-tap ----
+  test("classify tap: tiny move, short", function () {
+    eq(M.classify(one([[0, 100, 100], [60, 102, 101], [90, 102, 101]]), st({})), "tap");
+  });
+  test("classify not a tap at 300 ms (long press -> pan)", function () {
+    eq(M.classify(one([[0, 100, 100], [300, 100, 100]]), st({})), "pan");
+  });
+  test("classify not a tap at 10 px movement", function () {
+    eq(M.classify(one([[0, 100, 100], [80, 110, 100]]), st({})), "pan");
+  });
+  test("classify tap that wanders then returns still taps (max displacement < 10)", function () {
+    eq(M.classify(one([[0, 100, 100], [30, 106, 100], [60, 100, 103], [90, 100, 100]]), st({})), "tap");
+  });
+  test("classify double-tap: 120 ms after, 10 px away", function () {
+    var s = st({ lastTapT: 1000, lastTapX: 100, lastTapY: 100 });
+    eq(M.classify(one([[1120, 110, 100], [1170, 110, 100]]), s), "double-tap");
+  });
+  test("classify double-tap accepted at 249 ms, rejected at 251 ms", function () {
+    var s = st({ lastTapT: 1000, lastTapX: 100, lastTapY: 100 });
+    eq(M.classify(one([[1249, 100, 100], [1290, 100, 100]]), s), "double-tap");
+    eq(M.classify(one([[1251, 100, 100], [1290, 100, 100]]), s), "tap");
+  });
+  test("classify second tap 300 ms later is a plain tap", function () {
+    var s = st({ lastTapT: 1000, lastTapX: 100, lastTapY: 100 });
+    eq(M.classify(one([[1300, 100, 100], [1340, 100, 100]]), s), "tap");
+  });
+  test("classify second tap 60 px away is a plain tap", function () {
+    var s = st({ lastTapT: 1000, lastTapX: 100, lastTapY: 100 });
+    eq(M.classify(one([[1100, 160, 100], [1140, 160, 100]]), s), "tap");
+  });
+  test("classify double-tap works while zoomed too (zoom out)", function () {
+    var s = st({ zoomed: true, lastTapT: 1000, lastTapX: 50, lastTapY: 50 });
+    eq(M.classify(one([[1100, 55, 50], [1130, 55, 50]]), s), "double-tap");
+  });
+
+  // ---- classify: swipe ----
+  test("classify fast swipe left -> swipe-left (next page)", function () {
+    eq(M.classify(one([[0, 300, 400], [60, 220, 405], [120, 120, 410]]), st({})), "swipe-left");
+  });
+  test("classify fast swipe right -> swipe-right", function () {
+    eq(M.classify(one([[0, 100, 400], [60, 190, 395], [120, 260, 390]]), st({})), "swipe-right");
+  });
+  test("classify swipe rejected when zoomed -> pan", function () {
+    eq(M.classify(one([[0, 300, 400], [120, 120, 410]]), st({ zoomed: true })), "pan");
+  });
+  test("classify diagonal rejected (|dx| < 2|dy|)", function () {
+    eq(M.classify(one([[0, 300, 400], [150, 200, 340]]), st({})), "pan");   // dx 100, dy 60
+  });
+  test("classify exactly |dx| = 2|dy| is still a swipe", function () {
+    eq(M.classify(one([[0, 300, 400], [150, 200, 450]]), st({})), "swipe-left"); // dx -100, dy 50
+  });
+  test("classify slow long swipe accepted by distance+velocity (600 ms, 300 px)", function () {
+    // 300 px / 600 ms = 0.5 px/ms > 0.4
+    eq(M.classify(one([[0, 350, 400], [300, 200, 402], [600, 50, 404]]), st({})), "swipe-left");
+  });
+  test("classify slow swipe rejected when too slow (1000 ms, 300 px = 0.3 px/ms)", function () {
+    eq(M.classify(one([[0, 350, 400], [500, 200, 402], [1000, 50, 404]]), st({})), "pan");
+  });
+  test("classify short move under 60 px is not a swipe", function () {
+    eq(M.classify(one([[0, 300, 400], [100, 245, 400]]), st({})), "pan");   // dx -55
+  });
+  test("classify exactly 60 px fast is a swipe", function () {
+    eq(M.classify(one([[0, 300, 400], [100, 240, 400]]), st({})), "swipe-left");
+  });
+  test("classify vertical drag -> pan", function () {
+    eq(M.classify(one([[0, 200, 500], [150, 205, 300]]), st({})), "pan");
+  });
+  test("classify slow drag while at fit -> pan", function () {
+    eq(M.classify(one([[0, 200, 400], [800, 215, 460]]), st({})), "pan");
+  });
+  test("classify axis v: up swipe -> swipe-up (next page)", function () {
+    eq(M.classify(one([[0, 200, 500], [150, 205, 300]]), st({ axis: "v" })), "swipe-up");
+  });
+  test("classify axis v: down swipe -> swipe-down (previous page)", function () {
+    eq(M.classify(one([[0, 200, 300], [150, 205, 500]]), st({ axis: "v" })), "swipe-down");
+  });
+  test("classify axis v: sideways move is not a swipe -> pan", function () {
+    eq(M.classify(one([[0, 300, 400], [120, 120, 410]]), st({ axis: "v" })), "pan");
+  });
+  test("classify axis v: diagonal rejected (|dy| < 2|dx|) -> pan", function () {
+    eq(M.classify(one([[0, 200, 300], [150, 260, 400]]), st({ axis: "v" })), "pan");   // dx 60, dy 100
+  });
+  test("classify axis v: slow and short rejected (1000 ms, 50 px) -> pan", function () {
+    eq(M.classify(one([[0, 200, 500], [1000, 205, 450]]), st({ axis: "v" })), "pan");
+  });
+  test("classify axis v: swipe rejected when zoomed -> pan", function () {
+    eq(M.classify(one([[0, 200, 500], [150, 205, 300]]), st({ axis: "v", zoomed: true })), "pan");
+  });
+  test("classify explicit axis h equals old result (h swipe, v drag)", function () {
+    eq(M.classify(one([[0, 300, 400], [60, 220, 405], [120, 120, 410]]), st({ axis: "h" })), "swipe-left");
+    eq(M.classify(one([[0, 200, 500], [150, 205, 300]]), st({ axis: "h" })), "pan");
+  });
+
+  // ---- classify: pinch / degenerate ----
+  test("classify two pointers down at once -> pinch", function () {
+    var g = [
+      { t: 0, id: 1, x: 100, y: 400, type: "down" },
+      { t: 10, id: 2, x: 250, y: 400, type: "down" },
+      { t: 60, id: 1, x: 80, y: 400, type: "move" },
+      { t: 60, id: 2, x: 270, y: 400, type: "move" },
+      { t: 120, id: 1, x: 80, y: 400, type: "up" },
+      { t: 125, id: 2, x: 270, y: 400, type: "up" }
+    ];
+    eq(M.classify(g, st({})), "pinch");
+  });
+  test("classify pinch wins even if short/small (two quick touches)", function () {
+    var g = [
+      { t: 0, id: 1, x: 100, y: 400, type: "down" },
+      { t: 5, id: 2, x: 120, y: 400, type: "down" },
+      { t: 40, id: 1, x: 100, y: 400, type: "up" },
+      { t: 45, id: 2, x: 120, y: 400, type: "up" }
+    ];
+    eq(M.classify(g, st({ lastTapT: 0, lastTapX: 100, lastTapY: 400 })), "pinch");
+  });
+  test("classify second finger after first lifted is NOT a pinch", function () {
+    var g = [
+      { t: 0, id: 1, x: 100, y: 400, type: "down" },
+      { t: 30, id: 1, x: 100, y: 400, type: "up" },
+      { t: 60, id: 2, x: 100, y: 400, type: "down" },
+      { t: 90, id: 2, x: 100, y: 400, type: "up" }
+    ];
+    ok(M.classify(g, st({})) !== "pinch");
+  });
+  test("classify empty samples -> pan (no throw)", function () {
+    eq(M.classify([], st({})), "pan");
+  });
+  test("classify missing state is tolerated", function () {
+    eq(M.classify(one([[0, 10, 10], [50, 10, 10]])), "tap");
+  });
+
+  // ---- constants ----
+  test("thresholds exported with the plan's values", function () {
+    eq(M.TILE, 1024); eq(M.TAP_MOVE_PX, 10); eq(M.TAP_MAX_MS, 300);
+    eq(M.DOUBLE_TAP_MS, 250); eq(M.DOUBLE_TAP_PX, 40);
+    eq(M.SWIPE_MIN_DX, 60); eq(M.SWIPE_RATIO, 2); eq(M.SWIPE_MAX_MS, 400); eq(M.SWIPE_MIN_VEL, 0.4);
+    eq(M.ZOOMED_FACTOR, 1.05); eq(M.MAX_PX_PER_PT, 16);
+  });
+  test("inputs are not mutated", function () {
+    var v = { s: 1, ox: 10, oy: 20 };
+    M.clampOffset(v, 612, 792, 412, 800); M.zoomAt(v, 2, 5, 5);
+    M.pinch(v, pt(0, 0), pt(10, 0), pt(0, 0), pt(20, 0));
+    eq(JSON.stringify(v), JSON.stringify({ s: 1, ox: 10, oy: 20 }));
+  });
+
+  var res = document.getElementById("result");
+  res.textContent = failures === 0 ? "ALL PASS" : "FAIL " + failures;
+  res.setAttribute("data-total", String(total));
+  var info = document.createElement("div");
+  info.textContent = "cases: " + total + ", failed: " + failures;
+  res.parentNode.insertBefore(info, res.nextSibling);
+})();
+</script>
+</body>
+</html>

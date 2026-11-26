@@ -1,0 +1,27 @@
+[package]
+name = "greenline"
+version = "0.1.7"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Greenline Android: Tauri 2 shell around the greenline-engine MuPDF library"
+publish = false
+
+[lib]
+# The Android loader expects lib<name>.so; tools/leakcheck-allow.txt names lib/arm64-v8a/libapp_lib.so.
+name = "app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+# The recent list passes through to the page as an opaque value (task 2bf.12).
+serde_json = "1"
+greenline-engine = { path = "../../engine" }
+# Local mobile plugin (task 2b.5): SAF picker -> detached fd. Kotlin in ../plugins/glfile/android.
+tauri-plugin-glfile = { path = "../plugins/glfile" }
+# Only for the runtime MuPDF version check in engine_info(): same 0.8 pin as the engine's mupdf crate,
+# so Cargo resolves it to the one mupdf-sys build already in the graph.
+mupdf-sys = { version = "0.8", default-features = false }

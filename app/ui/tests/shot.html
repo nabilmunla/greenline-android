@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>start screen screenshot page</title>
+<style>
+  html, body { margin: 0; background: #777; }
+  body { width: 412px; }
+</style>
+</head>
+<body>
+<script src="fakes.js"></script>
+<script>
+// Start screen at 412 x 900 with 4 synthetic recents. Screenshot it with msedge --headless=new
+// --screenshot (add --blink-settings=preferredColorScheme=1 for dark).
+(function () {
+  "use strict";
+  const now = Date.now();
+  const list = [
+    { id: "s1", name: "Sample drawing 01 Ground floor plan.pdf", pages: 12, last_page: 2, opened: now, thumb: GLFakes.thumb(130) },
+    { id: "s2", name: "Sample drawing 02 Sections and elevations with a very long title that is cut.pdf", pages: 8, last_page: 0, opened: now - 86400000, thumb: null },
+    { id: "s3", name: "Sample drawing 03 Roof.pdf", pages: 3, last_page: 1, opened: now - 5 * 86400000, thumb: GLFakes.thumb(200) },
+    { id: "s4", name: "Sample drawing 04.pdf", pages: null, last_page: null, opened: now - 40 * 86400000, thumb: null },
+  ];
+  GLFakes.load({ recents: list, isDefault: false, width: 412, height: 900 });
+})();
+</script>
+</body>
+</html>

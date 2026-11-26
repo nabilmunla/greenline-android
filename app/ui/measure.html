@@ -1,0 +1,91 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>Greenline: Speed test</title>
+  <style>
+    :root { color-scheme: light dark; }
+    body { font-family: system-ui, sans-serif; margin: 0; padding: 16px; line-height: 1.45; }
+    h1 { font-size: 1.4rem; margin: 0 0 4px; }
+    h2 { font-size: 1.1rem; margin: 24px 0 8px; }
+    .muted { opacity: 0.7; margin: 0 0 12px; font-size: 0.9rem; }
+    button { font-size: 1rem; padding: 10px 16px; border-radius: 8px; border: 1px solid #2e7d32;
+             background: #2e7d32; color: #fff; }
+    button.ghost { background: transparent; color: inherit; }
+    button:disabled { opacity: 0.5; }
+    select { font-size: 1rem; padding: 8px; border-radius: 8px; }
+    .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin: 10px 0; }
+    .err { color: #c62828; }
+    .note { background: #fff3e0; color: #000; padding: 8px 12px; border-radius: 8px; }
+    .note[hidden], .err[hidden] { display: none; }
+    table { border-collapse: collapse; font-variant-numeric: tabular-nums; font-size: 0.85rem; width: 100%; }
+    th, td { border-bottom: 1px solid #8884; padding: 4px 6px; text-align: right; white-space: nowrap; }
+    th:first-child, td:first-child { text-align: left; }
+    .wrap { overflow-x: auto; }
+    .pass { color: #2e7d32; font-weight: 600; }
+    .fail { color: #c62828; font-weight: 600; }
+    .na, .missing { opacity: 0.6; }
+    #log { font: 12px/1.4 ui-monospace, monospace; white-space: pre-wrap; }
+
+    /* Full-screen run view: the canvas the first view and the 400 % tiles are painted on. */
+    #runview { position: fixed; inset: 0; display: flex; flex-direction: column; background: #3a3a3a; z-index: 10; }
+    #runview[hidden] { display: none; }
+    #rbar { display: flex; align-items: center; gap: 8px; padding: 6px 8px; background: #1b5e20; color: #fff; }
+    #rbar .grow { flex: 1; }
+    #rstep { font-variant-numeric: tabular-nums; }
+    #rbar button { padding: 6px 12px; background: #c62828; border-color: #c62828; }
+    #rstage { position: relative; flex: 1; min-height: 0; }
+    #rcanvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+  </style>
+</head>
+<body>
+  <div class="row">
+    <button id="back" class="ghost" type="button">← Back</button>
+  </div>
+  <h1>Speed test</h1>
+  <p class="muted">Pick the label for the file, then pick the file. Only numbers are saved: no file names.</p>
+  <p class="note" id="recovered" hidden></p>
+
+  <div class="row">
+    <label for="label">Label</label>
+    <select id="label"></select>
+    <label><input type="checkbox" id="walk"> Whole-file walk</label>
+  </div>
+  <div class="row">
+    <button id="run" type="button">Pick file and run</button>
+  </div>
+  <p class="err" id="err" hidden></p>
+  <div id="log"></div>
+
+  <h2>Pass marks (latest run per label)</h2>
+  <p class="muted" id="marks"></p>
+  <div class="wrap">
+    <table>
+      <thead>
+        <tr><th>Label</th><th>Kill</th><th>First view</th><th>400 % tile</th><th>Refill</th><th>Pages (median / max)</th><th>Peak</th><th>Direct</th></tr>
+      </thead>
+      <tbody id="summary"></tbody>
+    </table>
+  </div>
+  <p class="muted">Peak is the app's main process (VmHWM). The WebView runs in its own process and is not counted.</p>
+
+  <h2>Export</h2>
+  <p class="muted" id="count"></p>
+  <div class="row">
+    <button id="export" type="button">Export results</button>
+  </div>
+  <p id="exported"></p>
+
+  <section id="runview" hidden>
+    <div id="rbar">
+      <span id="rlabel"></span>
+      <span id="rstep" class="grow"></span>
+      <button id="cancel" type="button">Cancel</button>
+    </div>
+    <div id="rstage"><canvas id="rcanvas"></canvas></div>
+  </section>
+
+  <script src="measure.js"></script>
+</body>
+</html>
