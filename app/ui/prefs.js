@@ -13,6 +13,7 @@
   // name -> { def: default value, ok: (value) => is this value allowed }
   const DEFS = {
     pageDirection: { def: "vertical", ok: (v) => v === "vertical" || v === "sideways" },
+    updateCheck: { def: "on", ok: (v) => v === "on" || v === "off" }, // automatic once-a-day update check
   };
 
   let mem = null;        // in-memory copy: used when storage cannot be read or written

@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- No permissions: ACTION_OPEN_DOCUMENT grants per-URI read access to the picked document. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- Task 2b.9 in-app updater: open Android's installer on a downloaded update (the user still
+         taps Install; Android allows no silent install outside a store). -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
     <!-- Package visibility (Android 11+): isDefaultPdfApp() asks PackageManager who handles
          "VIEW application/pdf". Without this element every other PDF app is hidden from the query, the
          answer can only be Greenline itself, and the app would wrongly report it is the default viewer.
@@ -11,4 +14,16 @@
             <data android:mimeType="application/pdf" />
         </intent>
     </queries>
+    <application>
+        <!-- Task 2b.9: shares only cache/update/ (the verified update APK) with the installer. -->
+        <provider
+            android:name="com.greenline.glfile.GlUpdateProvider"
+            android:authorities="${applicationId}.glupdate"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/gl_update_paths" />
+        </provider>
+    </application>
 </manifest>

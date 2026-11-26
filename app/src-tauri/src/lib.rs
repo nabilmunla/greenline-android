@@ -11,6 +11,7 @@ mod host;
 mod jni;
 mod measure;
 mod open;
+mod update;
 mod protocol;
 
 use std::ffi::CString;
@@ -91,6 +92,10 @@ pub fn run() {
             open::show_page,
             open::cancel,
             open::drop_sharp,
+            update::update_check,
+            update::update_download,
+            update::update_progress,
+            update::update_install,
             measure::measure_start,
             measure::measure_plan,
             measure::measure_step,

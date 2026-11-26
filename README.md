@@ -19,6 +19,7 @@ Greenline is built for big, dense sheets: architectural, structural and MEP draw
 
   Files opened from attachments usually can't be reopened later, so they don't appear in Recent.
 - **Memory:** the app's memory limits follow your phone's RAM, and it releases memory when Android asks.
+- **Updates:** once a day the app checks this repository for a newer release and offers it on the start screen. One tap downloads it; Android then asks you to install. The download is checked first: it must be this app, a newer version, and signed with the same key. Settings > Updates turns the daily check off.
 
 Markup, comments, measuring and search are planned.
 
@@ -26,13 +27,13 @@ Markup, comments, measuring and search are planned.
 1. Download the APK from [Releases](../../releases) and open it on your phone.
 2. Android asks you to allow installs from that source. Allow it, then tap Install.
 
-Updates are signed with the same key and install over the previous version.
+Updates are signed with the same key and install over the previous version. From 0.1.9 on, the app offers new versions itself; you can also use the Releases page or an updater such as Obtainium.
 
 Requirements: Android 11 or later, on a 64-bit ARM phone.
 
 ## Privacy
 - Greenline has no account and no analytics.
-- It makes no network connections in this version. Android lists a network permission only because the web view framework (Tauri) declares it.
+- Its only network connection is the update check. About once a day while the app is open (and when you tap Check now) it asks GitHub for this repository's latest release. It downloads an update, from GitHub, only when you tap Update. The app sends nothing about you, your phone or your files; GitHub sees your internet address (IP), as any website does. You can turn the daily check off in Settings > Updates.
 - Your files stay where they are; Greenline only reads them.
 - The recent-files list and its thumbnails stay on your phone. They are excluded from backups and from device-to-device transfers.
 

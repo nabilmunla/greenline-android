@@ -44,6 +44,7 @@
     .note { background: var(--note-bg); padding: 14px 16px; margin-bottom: 8px; }
     .note p, .errcard p { margin: 0 0 8px; font-size: 0.95rem; }
     .note .btn, .errcard .btn { min-width: 96px; }
+    .note h3 { margin: 0 0 4px; font-size: 1.05rem; font-weight: 600; }
     .errcard { background: var(--err-bg); color: var(--err-text); border-color: var(--err-text); padding: 14px 16px; margin-bottom: 8px; }
     .errcard .btn { background: transparent; color: var(--err-text); border-color: var(--err-text); }
     .acts { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
@@ -100,6 +101,10 @@
     #settings .setting { padding: 16px; }
     #settings .setting h2 { margin: 0; font-size: 1.05rem; font-weight: 600; }
     #settings .setting p { margin: 2px 0 12px; font-size: 0.9rem; color: var(--muted); }
+    #settings .setting + .setting { margin-top: 12px; }
+    #settings .setting p.status { margin: 12px 0 0; color: var(--text); }
+    #settings .setting p.status[hidden] { display: none; }
+    #upd_check { display: block; width: 100%; margin-top: 12px; }
     #settings .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 0; border: 1px solid var(--btn); border-radius: 12px; overflow: hidden; }
     #settings .seg button { min-height: 52px; min-width: 0; padding: 0 8px; border: 0; background: transparent; color: var(--accent); font-size: 1rem; font-weight: 600; }
     #settings .seg button + button { border-left: 1px solid var(--btn); }
@@ -170,6 +175,14 @@
         <div class="acts">
           <button id="smsg_act" class="btn" type="button" hidden></button>
           <button id="smsg_ok" class="btn" type="button">OK</button>
+        </div>
+      </div>
+      <div id="updcard" class="card note" hidden>
+        <h3>Update available</h3>
+        <p id="upd_text" aria-live="polite"></p>
+        <div class="acts">
+          <button id="upd_later" class="btn ghost" type="button">Later</button>
+          <button id="upd_go" class="btn" type="button">Update</button>
         </div>
       </div>
       <div id="defcard" class="card note" hidden>
@@ -244,6 +257,16 @@
           <button id="dir_vertical" type="button" role="radio" aria-checked="true">Vertical</button>
           <button id="dir_sideways" type="button" role="radio" aria-checked="false">Sideways</button>
         </div>
+      </div>
+      <div class="card setting">
+        <h2 id="s_upd_t">Updates</h2>
+        <p id="s_upd_h">Once a day, Greenline asks GitHub whether a newer version is out. Nothing else is sent.</p>
+        <div class="seg" role="radiogroup" aria-labelledby="s_upd_t" aria-describedby="s_upd_h">
+          <button id="upd_on" type="button" role="radio" aria-checked="true">On</button>
+          <button id="upd_off" type="button" role="radio" aria-checked="false">Off</button>
+        </div>
+        <button id="upd_check" class="btn" type="button">Check now</button>
+        <p id="upd_status" class="status" role="status" aria-live="polite" hidden></p>
       </div>
     </div>
   </div>

@@ -1,6 +1,6 @@
 // Greenline start screen (tasks 2bf.13 / 2bf.14).
-// Shows Continue, the Recent list, the Open PDF button, the default-app card, the Settings sheet and
-// the About sheet. Preferences live in window.GLPrefs (prefs.js).
+// Shows Continue, the Recent list, the Open PDF button, the default-app card, the update card (task 2b.9),
+// the Settings sheet and the About sheet. Preferences live in window.GLPrefs (prefs.js).
 // It drives the viewer through window.GLViewer (viewer.js) and talks to the app through
 // window.__TAURI__.core.invoke. File names are display-only: this file never logs anything.
 (function () {
@@ -9,6 +9,9 @@
   const $ = (id) => document.getElementById(id);
   const MAX_RECENTS = 20;
   const DISMISS_KEY = "gl.defaultCard.dismissed";
+  const LAST_CHECK_KEY = "gl.update.lastCheck";
+  const CHECK_EVERY_MS = 20 * 3600 * 1000;
+  const POLL_MS = 500;
   const MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
   const PLACEHOLDER_SVG =
     '<svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">' +
@@ -24,6 +27,14 @@
   let sheetOpen = null; // which sheet is open: "about", "settings" or null (only one at a time)
   let sheetPushed = false;
   let menuAnchor = null;
+  let lastCheckMem = null;   // last automatic or manual check time, kept here when storage fails
+  let autoBusy = false;
+  let manualBusy = false;
+  let upd = null;            // the update on offer: { version, size } (null: none)
+  let updBusy = false;       // a download or install call is running
+  let updRun = 0;            // bumped when a download starts and ends, so stale progress polls are ignored
+  let updPolling = false;
+  let updGo = null;          // what the main card button does right now
 
   // --- app and viewer access (looked up on every call so fakes and late loads work) -------------
 
@@ -407,6 +418,16 @@
       const b = $("dir_" + v);
       b.setAttribute("aria-checked", v === cur ? "true" : "false");
     }
+    const u = p ? p.get("updateCheck") : "on";
+    for (const v of ["on", "off"]) {
+      $("upd_" + v).setAttribute("aria-checked", v === u ? "true" : "false");
+    }
+  }
+
+  function setUpdateCheck(v) {
+    const p = prefs();
+    if (p) p.set("updateCheck", v);
+    syncSettings();
   }
 
   function setPageDirection(v) {
@@ -417,6 +438,7 @@
 
   function openSettings() {
     if (!openSheet("settings", "settings", "settings_close")) return;
+    if (!manualBusy) $("upd_status").hidden = true;
     syncSettings();
   }
 
@@ -441,11 +463,197 @@
     }
   }
 
+  // --- updates (task 2b.9) ---------------------------------------------------------------------------------
+  // update_check / update_download / update_progress / update_install are native commands. They reject with a
+  // fixed code string; the UI only ever shows fixed sentences or that code, never the error text itself.
+
+  function errCode(e) {
+    return typeof e === "string" && /^E_[A-Z0-9_]{1,40}$/.test(e) ? e : "E_UPDATE_FAILED";
+  }
+
+  function cleanVersion(v) {
+    return typeof v === "string" && /^[0-9A-Za-z][0-9A-Za-z.+-]{0,31}$/.test(v) ? v : null;
+  }
+  function cleanSize(s) {
+    return typeof s === "number" && isFinite(s) && s > 0 && s < 100000 ? Math.round(s * 10) / 10 : null;
+  }
+
+  function readLastCheck() {
+    try {
+      const raw = window.localStorage.getItem(LAST_CHECK_KEY);
+      const n = raw === null ? NaN : Number(raw);
+      if (isFinite(n) && n > 0) return n;
+    } catch (_) { /* fall back to the in-memory time */ }
+    return lastCheckMem;
+  }
+  function recordCheck() {
+    const now = Date.now();
+    lastCheckMem = now;
+    try { window.localStorage.setItem(LAST_CHECK_KEY, String(now)); } catch (_) { /* kept for this run only */ }
+  }
+  // True when no check is recorded, the record is from the future (clock change) or it is over 20 hours old.
+  function checkDue() {
+    const last = readLastCheck(), now = Date.now();
+    return last === null || last > now || now - last > CHECK_EVERY_MS;
+  }
+
+  // Asks the app once and records the time even when it fails. -> { available, version, size } or { error: code }
+  async function runCheck() {
+    recordCheck();
+    try {
+      const r = await invoke("update_check");
+      if (r && r.available === true) return { available: true, version: cleanVersion(r.version), size: cleanSize(r.size_mb) };
+      return { available: false };
+    } catch (e) {
+      return { error: errCode(e) };
+    }
+  }
+
+  // The automatic check: only when the pref is on, and never more than once per 20 hours. Failures show nothing.
+  async function maybeAutoCheck() {
+    const p = prefs();
+    if ((p ? p.get("updateCheck") : "on") !== "on") return;
+    if (autoBusy || !checkDue()) return;
+    autoBusy = true;
+    try {
+      const r = await runCheck();
+      if (r.available) offerUpdate(r);
+    } finally {
+      autoBusy = false;
+    }
+  }
+
+  function paintUpd(text, goLabel, goDisabled, laterDisabled) {
+    $("upd_text").textContent = text;
+    const g = $("upd_go");
+    g.hidden = goLabel === null;
+    if (goLabel !== null) { g.textContent = goLabel; g.disabled = goDisabled; }
+    $("upd_later").disabled = laterDisabled;
+    $("updcard").hidden = false;
+  }
+  function offerText() {
+    if (!upd.version) return "A new version is available.";
+    return "Version " + upd.version + (upd.size ? " (" + upd.size + " MB)" : "");
+  }
+  function paintOffer() { updGo = startUpdate; paintUpd(offerText(), "Update", false, false); }
+  function paintProgress(pct) { paintUpd(offerText(), "Downloading\u2026 " + pct + " %", true, true); }
+  function paintError(code) {
+    let t = "Update failed (" + code + ").";
+    if (code === "E_UPDATE_NETWORK") t = "No connection. Try again later.";
+    else if (code === "E_UPDATE_SIGNATURE") t = "The download failed the safety check and was deleted.";
+    updGo = startUpdate;
+    paintUpd(t, "Try again", false, false);
+  }
+
+  // Shows the card for an update found by a check. A download or install already under way is left alone.
+  function offerUpdate(r) {
+    if (updBusy) return;
+    upd = { version: r.version, size: r.size };
+    paintOffer();
+  }
+
+  function dismissUpdateCard() {
+    if (updBusy) return;
+    $("updcard").hidden = true;
+  }
+
+  function progressPct(r) {
+    const d = r && r.done, t = r && r.total;
+    if (typeof d !== "number" || typeof t !== "number" || !(t > 0) || !(d >= 0)) return 0;
+    return Math.max(0, Math.min(100, Math.floor((d / t) * 100)));
+  }
+
+  async function pollProgress(run) {
+    if (updPolling) return;
+    updPolling = true;
+    try {
+      const r = await invoke("update_progress");
+      if (run === updRun) paintProgress(progressPct(r));
+    } catch (_) {
+      /* a missed reading is fine: the next one follows */
+    } finally {
+      updPolling = false;
+    }
+  }
+
+  async function installUpdate() {
+    paintUpd(offerText(), "Install", true, true);
+    let r = null;
+    try {
+      r = await invoke("update_install");
+    } catch (e) {
+      paintError(errCode(e));
+      return;
+    }
+    if (r && r.opened === true) {
+      paintUpd("Follow Android's prompt to install. Your files and settings stay.", null, false, false);
+    } else if (r && r.opened === false) {
+      updGo = installAgain;
+      paintUpd("Allow Greenline to install updates in the screen that opened, then tap Install.", "Install", false, false);
+    } else {
+      paintError("E_UPDATE_FAILED");
+    }
+  }
+
+  async function installAgain() {
+    if (updBusy) return;
+    updBusy = true;
+    try { await installUpdate(); } finally { updBusy = false; }
+  }
+
+  async function startUpdate() {
+    if (updBusy || !upd) return;
+    updBusy = true;
+    const run = ++updRun;
+    paintProgress(0);
+    const timer = setInterval(() => { pollProgress(run); }, POLL_MS);
+    try {
+      let failed = null;
+      try {
+        await invoke("update_download");
+      } catch (e) {
+        failed = errCode(e);
+      } finally {
+        clearInterval(timer);
+        updRun++;
+      }
+      if (failed !== null) paintError(failed);
+      else await installUpdate();
+    } finally {
+      updBusy = false;
+    }
+  }
+
+  // Settings "Check now": shows one of three fixed status lines.
+  async function checkNow() {
+    if (manualBusy) return;
+    manualBusy = true;
+    const st = $("upd_status");
+    $("upd_check").disabled = true;
+    st.textContent = "Checking\u2026";
+    st.hidden = false;
+    try {
+      const r = await runCheck();
+      if (r.error) {
+        st.textContent = "Could not check (" + r.error + ").";
+      } else if (r.available) {
+        st.textContent = r.version ? "Version " + r.version + " is available." : "A new version is available.";
+        offerUpdate(r);
+      } else {
+        st.textContent = "You have the latest version.";
+      }
+    } finally {
+      $("upd_check").disabled = false;
+      manualBusy = false;
+    }
+  }
+
   // --- wiring -----------------------------------------------------------------------------------------------
 
   function onViewerExit() {
     closeMenu();
     refresh();
+    maybeAutoCheck();
     // A file that came from another app: go back to that app instead of staying here.
     const cur = viewerCall("current");
     if (cur && cur.incoming) {
@@ -467,6 +675,11 @@
     $("settings_close").addEventListener("click", () => closeSettings(false));
     $("dir_vertical").addEventListener("click", () => setPageDirection("vertical"));
     $("dir_sideways").addEventListener("click", () => setPageDirection("sideways"));
+    $("upd_on").addEventListener("click", () => setUpdateCheck("on"));
+    $("upd_off").addEventListener("click", () => setUpdateCheck("off"));
+    $("upd_check").addEventListener("click", checkNow);
+    $("upd_later").addEventListener("click", dismissUpdateCard);
+    $("upd_go").addEventListener("click", () => { if (updGo) updGo(); });
     $("d_info").addEventListener("click", engineInfo);
     $("d_measure").addEventListener("click", () => { location.href = "measure.html"; });
 
@@ -485,7 +698,10 @@
 
     viewerCall("onExit", onViewerExit);
     document.addEventListener("visibilitychange", () => {
-      if (document.visibilityState === "visible") { checkIncoming(); refresh(); }
+      if (document.visibilityState === "visible") {
+        checkIncoming(); refresh();
+        if (!viewerCall("isOpen")) maybeAutoCheck();
+      }
     });
     try {
       const t = window.__TAURI__;
@@ -500,7 +716,7 @@
     window.addEventListener("focus", () => checkIncoming());
     setInterval(() => { if (document.visibilityState === "visible") checkIncoming(); }, 2000);
 
-    return Promise.all([refresh(), checkIncoming()]);
+    return Promise.all([refresh(), checkIncoming(), maybeAutoCheck()]);
   }
 
   window.GLStart = {

@@ -237,6 +237,57 @@ class GlFilePlugin(private val activity: Activity) : Plugin(activity) {
         invoke.resolve(ret)
     }
 
+    // ---------------------------------------------------------------------------------------------
+    // Task 2b.9: in-app updater (GlUpdater / UpdateCore). Network and file work runs off the UI thread;
+    // every rejection is a fixed E_UPDATE_* code.
+
+    private val updater by lazy { GlUpdater(activity) }
+
+    private fun updateJob(invoke: Invoke, job: () -> JSObject) {
+        Thread {
+            try {
+                invoke.resolve(job())
+            } catch (e: UpdateCore.Rejected) {
+                invoke.reject("update failed", e.code)
+            } catch (e: Exception) {
+                invoke.reject("update failed", "E_UPDATE_FAILED")
+            }
+        }.start()
+    }
+
+    @Command
+    fun checkUpdate(invoke: Invoke) = updateJob(invoke) {
+        val o = updater.check()
+        val ret = JSObject()
+        ret.put("available", o != null)
+        if (o != null) {
+            ret.put("version", o.version)
+            ret.put("size_mb", Math.round(o.size / 104857.6) / 10.0)
+        }
+        ret
+    }
+
+    @Command
+    fun downloadUpdate(invoke: Invoke) = updateJob(invoke) {
+        updater.download()
+        JSObject()
+    }
+
+    @Command
+    fun updateProgress(invoke: Invoke) {
+        val ret = JSObject()
+        ret.put("done", updater.done)
+        ret.put("total", updater.total)
+        invoke.resolve(ret)
+    }
+
+    @Command
+    fun installUpdate(invoke: Invoke) = updateJob(invoke) {
+        val ret = JSObject()
+        ret.put("opened", updater.install())
+        ret
+    }
+
     // Back from a file another app sent: return the user to that app.
     @Command
     fun moveToBack(invoke: Invoke) {

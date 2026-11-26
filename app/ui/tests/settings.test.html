@@ -25,6 +25,7 @@
   const log = document.getElementById("log");
   const stage = document.getElementById("stage");
   const KEY = "gl.prefs";
+  const LAST = "gl.update.lastCheck";
   let failures = 0, total = 0;
 
   function ok(c, m) { if (!c) throw new Error(m || "assertion failed"); }
@@ -80,8 +81,13 @@
   }
 
   // The start page with fakes; o: make() options + width/height. prefRaw seeds gl.prefs first.
+  // o.lastCheck seeds "gl.update.lastCheck" (default: just now, so there is no automatic update check; null = missing).
   async function page(o, prefRaw) {
     store(prefRaw === undefined ? null : prefRaw);
+    try {
+      const lc = !o || o.lastCheck === undefined ? Date.now() : o.lastCheck;
+      if (lc === null) localStorage.removeItem(LAST); else localStorage.setItem(LAST, String(lc));
+    } catch (_) { throw new Error("localStorage is not usable in the test page"); }
     o = Object.assign({ host: stage, width: 360, height: 740, recents: [] }, o || {});
     const p = await F.load(o);
     p.$ = (id) => p.doc.getElementById(id);
@@ -97,20 +103,25 @@
       await p.click(item);
     };
     p.back = async () => { p.win.dispatchEvent(new p.win.PopStateEvent("popstate", { state: null })); await sleep(20); };
-    p.checked = () => p.qa("#settings [role=radio]").filter((b) => b.getAttribute("aria-checked") === "true").map((b) => b.textContent);
+    const on = (i) => p.qa("#settings .seg")[i].querySelectorAll("[role=radio]");
+    p.checked = () => Array.from(on(0)).filter((b) => b.getAttribute("aria-checked") === "true").map((b) => b.textContent);        // Page direction
+    p.checkedUpd = () => Array.from(on(1)).filter((b) => b.getAttribute("aria-checked") === "true").map((b) => b.textContent);     // Updates
+    p.status = () => p.$("upd_status");
+    p.cmds = (c) => p.fake.calls.invoke.filter((x) => x.cmd === c);
     p.done = () => p.iframe.remove();
     return p;
   }
   async function withPage(o, raw, fn) {
     const p = await page(o, raw);
-    try { await fn(p); } finally { p.done(); store(null); }
+    try { await fn(p); } finally { p.done(); store(null); try { localStorage.removeItem(LAST); } catch (_) { /* ignore */ } }
   }
 
   async function run() {
     // ---------------------------------------------------------------- GLPrefs
-    await test("nothing stored: pageDirection is vertical, all() has the defaults", () => withPrefs(null, async (g) => {
+    await test("nothing stored: pageDirection is vertical and updateCheck is on, all() has the defaults", () => withPrefs(null, async (g) => {
       eq(g.get("pageDirection"), "vertical");
-      eq(JSON.stringify(g.all()), JSON.stringify({ pageDirection: "vertical" }));
+      eq(g.get("updateCheck"), "on");
+      eq(JSON.stringify(g.all()), JSON.stringify({ pageDirection: "vertical", updateCheck: "on" }));
     }));
 
     await test("set sideways, then a fresh read (reload) gives sideways", () => withPrefs(null, async (g) => {
@@ -144,12 +155,38 @@
       eq(g.get("pageDirection"), "sideways", "a rejected value leaves the saved one alone");
       eq(g.set("colour", "red"), false);
       eq(g.get("colour"), undefined);
-      eq(JSON.stringify(g.all()), JSON.stringify({ pageDirection: "sideways" }), "no unknown keys");
+      eq(JSON.stringify(g.all()), JSON.stringify({ pageDirection: "sideways", updateCheck: "on" }), "no unknown keys");
     }));
 
     await test("unknown keys in storage are not returned by all()", () => withPrefs("{\"pageDirection\":\"sideways\",\"other\":1}", async (g) => {
-      eq(JSON.stringify(g.all()), JSON.stringify({ pageDirection: "sideways" }));
+      eq(JSON.stringify(g.all()), JSON.stringify({ pageDirection: "sideways", updateCheck: "on" }));
     }));
+
+    await test("updateCheck: off is saved and survives a reload; on puts it back; other values are ignored", () => withPrefs(null, async (g) => {
+      eq(g.set("updateCheck", "off"), true);
+      eq(g.get("updateCheck"), "off");
+      eq(JSON.parse(stored()).updateCheck, "off", "stored as JSON under gl.prefs");
+      eq(g.get("pageDirection"), "vertical", "the other pref is untouched");
+      const again = await freshPrefs();
+      try { eq(again.prefs.get("updateCheck"), "off", "after reload"); } finally { again.done(); }
+      eq(g.set("updateCheck", "maybe"), false);
+      eq(g.set("updateCheck", true), false);
+      eq(g.get("updateCheck"), "off", "a rejected value leaves the saved one alone");
+      g.set("updateCheck", "on");
+      eq(g.get("updateCheck"), "on");
+    }));
+
+    await test("updateCheck: corrupt or wrong-shaped stored values give on", async () => {
+      for (const raw of ["{not json", "null", "[]", "{}", "{\"updateCheck\":7}", "{\"updateCheck\":null}", "{\"updateCheck\":\"Off\"}", "{\"updateCheck\":\"never\"}"]) {
+        await withPrefs(raw, async (g) => { eq(g.get("updateCheck"), "on", raw); });
+      }
+    });
+
+    await test("updateCheck: works in memory when storage throws", () => withPrefs(null, async (g) => {
+      eq(g.get("updateCheck"), "on");
+      eq(g.set("updateCheck", "off"), true);
+      eq(g.get("updateCheck"), "off");
+    }, throwingStorage));
 
     await test("storage that throws on every access: still works in memory", () => withPrefs(null, async (g, f) => {
       let threw = false;
@@ -184,19 +221,26 @@
       ok(c.width >= 48 && c.height >= 48, "close button " + c.width + "x" + c.height);
     }));
 
-    await test("one row only: Page direction, its helper text, and a Vertical | Sideways control", () => withPage({}, null, async (p) => {
+    await test("two rows only: Page direction (Vertical | Sideways) and Updates (On | Off, Check now)", () => withPage({}, null, async (p) => {
       await p.openSettings();
-      eq(p.qa("#settings .setting").length, 1, "one setting row");
-      eq(p.q("#settings .setting h2").textContent, "Page direction");
-      eq(p.q("#settings .setting p").textContent, "How you swipe between pages.");
-      eq(p.qa("#settings .seg button").map((b) => b.textContent).join("|"), "Vertical|Sideways");
-      eq(p.qa("#settings button").length, 3, "close + two choices, nothing else");
+      const rows = p.qa("#settings .setting");
+      eq(rows.length, 2, "two setting rows");
+      eq(rows[0].querySelector("h2").textContent, "Page direction");
+      eq(rows[0].querySelector("p").textContent, "How you swipe between pages.");
+      eq(Array.from(rows[0].querySelectorAll(".seg button")).map((b) => b.textContent).join("|"), "Vertical|Sideways");
+      eq(rows[1].querySelector("h2").textContent, "Updates");
+      eq(rows[1].querySelector("p").textContent, "Once a day, Greenline asks GitHub whether a newer version is out. Nothing else is sent.");
+      eq(Array.from(rows[1].querySelectorAll(".seg button")).map((b) => b.textContent).join("|"), "On|Off");
+      eq(p.$("upd_check").textContent, "Check now");
+      eq(p.qa("#settings button").length, 6, "close + two + two choices + Check now, nothing else");
+      ok(!p.visible(p.$("upd_status")), "no status line before a check");
     }));
 
     await test("at 360 px both choices are at least 48 px tall and nothing overflows", () => withPage({ width: 360 }, null, async (p) => {
       await p.openSettings();
       const bs = p.qa("#settings .seg button");
-      eq(bs.length, 2);
+      eq(bs.length, 4);
+      bs.push(p.$("upd_check"));
       for (const b of bs) {
         const r = p.rect(b);
         ok(r.height >= 48, b.textContent + " is " + r.height + " px tall");
@@ -293,7 +337,127 @@
       ok(tok.length > 0, "--bg token exists");
       ok(bg !== "rgba(0, 0, 0, 0)" && bg !== "transparent", "explicit background " + bg);
     }));
-  }
+
+    // ---------------------------------------------------------------- Updates row (task 2b.9)
+    await test("Updates: nothing saved -> On is selected; saved off -> Off is selected; corrupt prefs -> On", async () => {
+      await withPage({}, null, async (p) => { await p.openSettings(); eq(p.checkedUpd().join("|"), "On"); });
+      await withPage({}, "{\"updateCheck\":\"off\"}", async (p) => {
+        await p.openSettings();
+        eq(p.checkedUpd().join("|"), "Off");
+        eq(p.checked().join("|"), "Vertical", "Page direction unaffected");
+        const a = p.win.getComputedStyle(p.$("upd_off")), b = p.win.getComputedStyle(p.$("upd_on"));
+        eq(a.backgroundColor, "rgb(46, 125, 50)");
+        ok(a.backgroundColor !== b.backgroundColor, "the other choice looks different");
+      });
+      await withPage({}, "{oops", async (p) => { await p.openSettings(); eq(p.checkedUpd().join("|"), "On"); });
+    });
+
+    await test("Updates: tapping Off saves it, tapping On puts it back; Page direction is not touched", () => withPage({}, null, async (p) => {
+      await p.openSettings();
+      await p.click(p.$("upd_off"));
+      eq(p.win.GLPrefs.get("updateCheck"), "off");
+      eq(JSON.parse(stored()).updateCheck, "off");
+      eq(p.checkedUpd().join("|"), "Off");
+      eq(p.checked().join("|"), "Vertical");
+      await p.click(p.$("dir_sideways"));
+      eq(p.win.GLPrefs.get("updateCheck"), "off", "choosing a direction keeps the updates choice");
+      await p.click(p.$("upd_on"));
+      eq(p.win.GLPrefs.get("updateCheck"), "on");
+      eq(p.checkedUpd().join("|"), "On");
+      eq(p.win.GLPrefs.get("pageDirection"), "sideways");
+    }));
+
+    await test("Updates: the choice is shown again when Settings is reopened", () => withPage({}, null, async (p) => {
+      await p.openSettings();
+      await p.click(p.$("upd_off"));
+      await p.click(p.$("settings_close"));
+      await p.openSettings();
+      eq(p.checkedUpd().join("|"), "Off");
+    }));
+
+    await test("Check now: no update -> You have the latest version.", () => withPage({}, null, async (p) => {
+      await p.openSettings();
+      ok(!p.visible(p.status()), "no status first");
+      await p.click(p.$("upd_check"));
+      eq(p.cmds("update_check").length, 1);
+      ok(p.visible(p.status()), "status shown");
+      eq(p.status().textContent, "You have the latest version.");
+      ok(p.rect(p.status()).top >= p.rect(p.$("upd_check")).bottom, "status sits under the button");
+      ok(!p.visible(p.$("updcard")), "no card");
+      ok(!p.$("upd_check").disabled, "button usable again");
+    }));
+
+    await test("Check now: update found -> Version X is available. and the start-screen card appears", () => withPage({ updateAvailable: true }, null, async (p) => {
+      await p.openSettings();
+      await p.click(p.$("upd_check"));
+      eq(p.status().textContent, "Version 0.1.9 is available.");
+      await p.click(p.$("settings_close"));
+      ok(p.visible(p.$("updcard")), "card on the start screen");
+      eq(p.q("#updcard h3").textContent, "Update available");
+      eq(p.$("upd_text").textContent, "Version 0.1.9 (13.1 MB)");
+      eq(Array.from(p.qa("#updcard button")).map((b) => b.textContent).join("|"), "Later|Update");
+    }));
+
+    await test("Check now: failure -> Could not check (CODE). and nothing raw", async () => {
+      for (const [rej, code] of [["E_UPDATE_NETWORK", "E_UPDATE_NETWORK"], ["E_UPDATE_UNSUPPORTED", "E_UPDATE_UNSUPPORTED"], [new Error("raw SENTINEL /storage/emulated/0/x.pdf"), "E_UPDATE_FAILED"], ["raw SENTINEL text", "E_UPDATE_FAILED"]]) {
+        await withPage({ updateCheckReject: rej }, null, async (p) => {
+          await p.openSettings();
+          await p.click(p.$("upd_check"));
+          eq(p.status().textContent, "Could not check (" + code + ").");
+          ok(p.doc.body.textContent.indexOf("SENTINEL") < 0, "no raw text");
+          ok(!p.visible(p.$("updcard")), "no card");
+        });
+      }
+    });
+
+    await test("Check now works with automatic checks off, and shows a new result each time", () => withPage({ updateAvailable: true }, "{\"updateCheck\":\"off\"}", async (p) => {
+      eq(p.cmds("update_check").length, 0, "nothing automatic");
+      await p.openSettings();
+      await p.click(p.$("upd_check"));
+      eq(p.cmds("update_check").length, 1);
+      eq(p.status().textContent, "Version 0.1.9 is available.");
+      eq(p.win.GLPrefs.get("updateCheck"), "off", "the pref is unchanged");
+    }));
+
+    await test("Check now: Later hides the card, and the next check brings it back", () => withPage({ updateAvailable: true }, null, async (p) => {
+      await p.openSettings();
+      await p.click(p.$("upd_check"));
+      await p.click(p.$("settings_close"));
+      await p.click(p.$("upd_later"));
+      ok(!p.visible(p.$("updcard")), "hidden by Later");
+      await p.openSettings();
+      ok(!p.visible(p.status()), "the status line is cleared when Settings opens again");
+      await p.click(p.$("upd_check"));
+      await p.click(p.$("settings_close"));
+      ok(p.visible(p.$("updcard")), "card back after the next check");
+      eq(p.cmds("update_check").length, 2);
+    }));
+
+    await test("Check now at 360 px: button and status fit, button is at least 48 px, in every status", async () => {
+      for (const o of [{}, { updateAvailable: true }, { updateCheckReject: "E_UPDATE_BAD_RELEASE" }]) {
+        await withPage(Object.assign({ width: 360 }, o), null, async (p) => {
+          await p.openSettings();
+          await p.click(p.$("upd_check"));
+          ok(p.visible(p.status()), "status shown");
+          const r = p.rect(p.$("upd_check"));
+          ok(r.height >= 48 && r.width >= 48, "Check now is " + r.width + "x" + r.height);
+          const de = p.doc.documentElement;
+          ok(de.scrollWidth <= de.clientWidth, "scrollWidth " + de.scrollWidth);
+          for (const el of p.qa("#settings, #settings *")) {
+            const q = p.rect(el);
+            if (q.width === 0) continue;
+            ok(q.left >= -0.5 && q.right <= 360.5, el.tagName + "#" + el.id + " spans " + q.left + ".." + q.right);
+          }
+        });
+      }
+    });
+
+    await test("Check now: the time of a manual check is recorded, so the next start does not check again", () => withPage({}, null, async (p) => {
+      localStorage.removeItem(LAST);
+      await p.openSettings();
+      await p.click(p.$("upd_check"));
+      ok(Math.abs(Number(localStorage.getItem(LAST)) - Date.now()) < 60000, "time recorded");
+    }));  }
 
   run().then(() => {
     document.getElementById("result").textContent = failures === 0 ? "ALL PASS" : "FAIL " + failures;

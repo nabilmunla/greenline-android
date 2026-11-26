@@ -1219,7 +1219,7 @@ dependencies = [
 
 [[package]]
 name = "greenline"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "greenline-engine",
  "mupdf-sys",

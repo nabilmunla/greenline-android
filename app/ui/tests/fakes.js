@@ -2,6 +2,18 @@
 // GLFakes.make(opts) builds a fake window.__TAURI__ and a fake window.GLViewer that record their calls.
 // GLFakes.load(opts) loads ../index.html into a fresh iframe of a given size with those fakes installed
 // BEFORE start.js runs (viewmath.js and viewer.js are left out), and resolves when start.js is ready.
+//
+// Updater stubs (task 2b.9), all optional make() options:
+//   updateAvailable (false), updateVersion ("0.1.9"), updateSize (13.1)  -> what update_check answers
+//   updateCheckReject: a code string (or any value) update_check rejects with
+//   downloadReject: value update_download rejects with (default: it succeeds); an array gives one value per call (the last repeats)
+//   downloadHold: true -> update_download stays pending until fake.st.finishDownload() / failDownload(value)
+//   downloadMs: delay before update_download settles (default 0; ignored with downloadHold)
+//   progress: array of {done, total} answers for update_progress, one per call (the last one repeats)
+//   installOpened: true (default) | false | an array of them, one per call (the last repeats)
+//   installReject: value update_install rejects with
+//   manualPoll: true -> the page's 500 ms setInterval (the progress poll) never fires by itself; the test calls
+//     await page.tick() to fire it, and fake.timers lists the intervals that are still running (so a stopped poll is visible)
 (function () {
   "use strict";
 
@@ -15,6 +27,12 @@
       listeners: {},
     };
     const calls = { invoke: [], open: [], resume: 0, listen: [] };
+    const timers = [];
+    const seq = (v, i) => (Array.isArray(v) ? v[Math.min(i, v.length - 1)] : v);
+    let progressN = 0, installN = 0, downloadN = 0;
+    let finish = null, fail = null;
+    st.finishDownload = () => { if (finish) finish({}); };
+    st.failDownload = (v) => { if (fail) fail(v); };
 
     function invoke(cmd, args) {
       calls.invoke.push({ cmd: cmd, args: args });
@@ -37,6 +55,30 @@
         }
         case "move_to_back":
           return Promise.resolve(true);
+        case "update_check": {
+          if (opts.updateCheckReject !== undefined) return Promise.reject(opts.updateCheckReject);
+          if (!opts.updateAvailable) return Promise.resolve({ available: false });
+          return Promise.resolve({
+            available: true,
+            version: opts.updateVersion === undefined ? "0.1.9" : opts.updateVersion,
+            size_mb: opts.updateSize === undefined ? 13.1 : opts.updateSize,
+          });
+        }
+        case "update_download":
+          if (opts.downloadHold) return new Promise((res, rej) => { finish = res; fail = rej; });
+          return new Promise((res, rej) => {
+            const bad = opts.downloadReject === undefined ? undefined : seq(opts.downloadReject, downloadN++);
+            setTimeout(() => (bad !== undefined ? rej(bad) : res({})), opts.downloadMs || 0);
+          });
+        case "update_progress": {
+          const list = opts.progress || [{ done: 0, total: 0 }];
+          return Promise.resolve(Object.assign({}, list[Math.min(progressN++, list.length - 1)]));
+        }
+        case "update_install": {
+          if (opts.installReject !== undefined) return Promise.reject(opts.installReject);
+          const o = seq(opts.installOpened === undefined ? true : opts.installOpened, installN++);
+          return Promise.resolve({ opened: o });
+        }
         default:
           return Promise.reject(new Error("unknown command"));
       }
@@ -67,7 +109,7 @@
       close: function () { return Promise.resolve(); },
     };
 
-    return { tauri: tauri, viewer: opts.noViewer ? null : viewer, calls: calls, st: st };
+    return { tauri: tauri, viewer: opts.noViewer ? null : viewer, calls: calls, st: st, timers: timers, manualPoll: !!opts.manualPoll };
   }
 
   function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
@@ -91,7 +133,11 @@
     iframe.style.cssText = "border:0;display:block;background:#888;width:" + (opts.width || 412) + "px;height:" + (opts.height || 800) + "px";
     (opts.host || document.body).appendChild(iframe);
     const base = new URL("../", location.href).href;
-    const fakeScript = "<script>window.__TAURI__=parent.__F.tauri;" + (opts.noViewer ? "" : "window.GLViewer=parent.__F.viewer;") + "<\/script>";
+    const pollScript = !opts.manualPoll ? "" :
+      "(function(){var F=parent.__F,si=window.setInterval,ci=window.clearInterval,n=0;" +
+      "window.setInterval=function(f,ms){if(ms!==500)return si.apply(window,arguments);var id=\"m\"+(++n);F.timers.push({id:id,f:f,ms:ms});return id;};" +
+      "window.clearInterval=function(id){for(var i=F.timers.length-1;i>=0;i--)if(F.timers[i].id===id)F.timers.splice(i,1);return ci.call(window,id);};})();";
+    const fakeScript = "<script>window.__TAURI__=parent.__F.tauri;" + (opts.noViewer ? "" : "window.GLViewer=parent.__F.viewer;") + pollScript + "<\/script>";
     let html = indexHtml()
       .replace('<script src="viewmath.js"></script>', "")
       .replace('<script src="viewer.js"></script>', "")

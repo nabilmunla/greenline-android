@@ -116,6 +116,17 @@ impl SaveError {
     }
 }
 
+/// The in-app updater's fixed error codes (task 2b.9).
+pub const UPDATE_CODES: &[&str] = &[
+    "E_UPDATE_NETWORK",
+    "E_UPDATE_BAD_RELEASE",
+    "E_UPDATE_SIZE",
+    "E_UPDATE_SIGNATURE",
+    "E_UPDATE_NO_DOWNLOAD",
+    "E_UPDATE_BUSY",
+    "E_UPDATE_FAILED",
+];
+
 /// Access to the plugin, kept in Tauri state; get it with [`GlFileExt::glfile`].
 pub struct GlFile<R: Runtime> {
     #[cfg(target_os = "android")]
@@ -162,6 +173,27 @@ impl<R: Runtime> GlFile<R> {
     /// `{ "is_default": bool }`: whether Greenline is the phone's default PDF app.
     pub async fn is_default_pdf_app(&self) -> Result<serde_json::Value, PickError> {
         self.call("isDefaultPdfApp", serde_json::json!({})).await
+    }
+
+    /// Task 2b.9 in-app updater: run `checkUpdate`, `downloadUpdate`, `updateProgress` or `installUpdate`.
+    /// Errors are only the fixed codes in [`UPDATE_CODES`] (anything else becomes `E_UPDATE_FAILED`).
+    pub async fn update(&self, cmd: &str) -> Result<serde_json::Value, &'static str> {
+        #[cfg(target_os = "android")]
+        {
+            use tauri::plugin::mobile::PluginInvokeError;
+            self.handle.run_mobile_plugin_async::<serde_json::Value>(cmd, serde_json::json!({})).await.map_err(|e| match e {
+                PluginInvokeError::InvokeRejected(r) => {
+                    let code = r.code.as_deref().unwrap_or("");
+                    UPDATE_CODES.iter().copied().find(|c| *c == code).unwrap_or("E_UPDATE_FAILED")
+                }
+                _ => "E_UPDATE_FAILED",
+            })
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = cmd;
+            Err("E_UPDATE_UNSUPPORTED")
+        }
     }
 
     /// Send the app to the background (Back after a file another app sent).

@@ -44,9 +44,18 @@
     log.appendChild(li);
   }
 
-  // Loads the page with fakes; clears any remembered dismissal first. o: make() options + width/height.
+  // Loads the page with fakes; clears any remembered dismissal and saved prefs first. o: make() options + width/height.
+  // o.lastCheck seeds "gl.update.lastCheck" (epoch ms; null = missing; default = just now, so no automatic update check
+  // happens unless a test asks for one). o.prefRaw seeds "gl.prefs".
   async function page(o) {
-    try { localStorage.removeItem("gl.defaultCard.dismissed"); } catch (_) { /* ignore */ }
+    try {
+      localStorage.removeItem("gl.defaultCard.dismissed");
+      localStorage.removeItem("gl.prefs");
+      if (o && o.prefRaw) localStorage.setItem("gl.prefs", o.prefRaw);
+      const lc = !o || o.lastCheck === undefined ? Date.now() : o.lastCheck;
+      if (lc === null) localStorage.removeItem("gl.update.lastCheck");
+      else localStorage.setItem("gl.update.lastCheck", String(lc));
+    } catch (_) { /* ignore */ }
     o = Object.assign({ host: stage }, o || {});
     const p = await F.load(o);
     p.$ = (id) => p.doc.getElementById(id);
@@ -58,6 +67,7 @@
     p.rows = () => p.qa("#rlist .row");
     p.lastOpen = () => p.fake.calls.open[p.fake.calls.open.length - 1];
     p.cmds = (c) => p.fake.calls.invoke.filter((x) => x.cmd === c);
+    p.tick = async () => { for (const t of p.fake.timers.slice()) t.f(); await sleep(30); };
     p.done = () => p.iframe.remove();
     return p;
   }
@@ -560,6 +570,278 @@
       p.win.dispatchEvent(new p.win.PopStateEvent("popstate", { state: null }));
       ok(!p.visible(p.$("about")), "still closed");
       ok(p.visible(p.$("start")), "start screen visible");
+    }));
+
+    // ---------------------------------------------------------------- updater (task 2b.9)
+    const H = 3600 * 1000;
+    const UP = (x) => Object.assign({ recents: [], updateAvailable: true, lastCheck: null, manualPoll: true }, x || {});
+    const ELL = "\u2026";
+    const cardBtns = (p) => p.qa("#updcard button").filter((b) => p.visible(b)).map((b) => b.textContent);
+    const lastCheckStored = () => Number(localStorage.getItem("gl.update.lastCheck"));
+
+    await test("updater: updateCheck defaults to on", () => withPage({ recents: [] }, async (p) => {
+      eq(p.win.GLPrefs.get("updateCheck"), "on");
+    }));
+
+    await test("updater: no stored time -> one automatic check, the time is recorded, a second trigger does not call again", () => withPage(UP(), async (p) => {
+      eq(p.cmds("update_check").length, 1, "one check on load");
+      ok(Math.abs(lastCheckStored() - Date.now()) < 60000, "time recorded " + lastCheckStored());
+      p.doc.dispatchEvent(new p.win.Event("visibilitychange"));
+      await p.win.GLStart.refresh();
+      await sleep(40);
+      eq(p.cmds("update_check").length, 1, "still one check");
+    }));
+
+    await test("updater: last check 21 h ago -> checks again; 19 h ago -> does not", async () => {
+      await withPage(UP({ lastCheck: Date.now() - 21 * H }), async (p) => {
+        eq(p.cmds("update_check").length, 1, "21 h");
+        ok(Date.now() - lastCheckStored() < 60000, "time moved forward");
+      });
+      await withPage(UP({ lastCheck: Date.now() - 19 * H }), async (p) => {
+        eq(p.cmds("update_check").length, 0, "19 h");
+        ok(!p.visible(p.$("updcard")), "no card");
+      });
+    });
+
+    await test("updater: unreadable stored time counts as missing", async () => {
+      for (const raw of ["abc", "", "-5"]) {
+        await withPage(UP({ lastCheck: raw }), async (p) => { eq(p.cmds("update_check").length, 1, "stored " + JSON.stringify(raw)); });
+      }
+    });
+
+    await test("updater: pref off -> no automatic call and no card, even with no stored time", () => withPage(UP({ prefRaw: "{\"updateCheck\":\"off\"}" }), async (p) => {
+      eq(p.cmds("update_check").length, 0);
+      ok(!p.visible(p.$("updcard")), "no card");
+      p.doc.dispatchEvent(new p.win.Event("visibilitychange"));
+      await sleep(40);
+      eq(p.cmds("update_check").length, 0);
+    }));
+
+    await test("updater: a failed background check shows nothing but still records the time", async () => {
+      for (const rej of ["E_UPDATE_NETWORK", new Error("raw SENTINEL /storage/emulated/0/x.pdf")]) {
+        await withPage(UP({ updateCheckReject: rej }), async (p) => {
+          eq(p.cmds("update_check").length, 1);
+          ok(Date.now() - lastCheckStored() < 60000, "time recorded");
+          ok(!p.visible(p.$("updcard")), "no card");
+          ok(!p.visible(p.$("smsg")), "no message");
+          ok(p.doc.body.textContent.indexOf("SENTINEL") < 0, "no raw text");
+        });
+      }
+    });
+
+    await test("updater: nothing newer -> no card", () => withPage(UP({ updateAvailable: false }), async (p) => {
+      ok(!p.visible(p.$("updcard")), "no card");
+    }));
+
+    await test("updater: card shows title, Version X (N MB), Update and Later, above the default-app card", () => withPage(UP({ isDefault: false, recents: R(2) }), async (p) => {
+      ok(p.visible(p.$("updcard")), "card visible");
+      eq(p.q("#updcard h3").textContent, "Update available");
+      eq(p.$("upd_text").textContent, "Version 0.1.9 (13.1 MB)");
+      eq(cardBtns(p).join("|"), "Later|Update");
+      ok(p.visible(p.$("defcard")), "default card also visible");
+      ok(p.rect(p.$("updcard")).bottom <= p.rect(p.$("defcard")).top, "update card above the default card");
+      eq(p.$("smain").firstElementChild.id, "smsg", "card is at the top of the screen content (the message slot is hidden)");
+      eq(p.$("smsg").nextElementSibling.id, "updcard");
+      const a = p.win.getComputedStyle(p.$("updcard")), b = p.win.getComputedStyle(p.$("defcard"));
+      eq(a.backgroundColor, b.backgroundColor, "same card colours as the default-app card (CSS tokens)");
+      eq(p.win.getComputedStyle(p.$("upd_go")).backgroundColor, "rgb(46, 125, 50)");
+    }));
+
+    await test("updater: size is shown without a trailing zero; a missing size leaves it out", async () => {
+      await withPage(UP({ updateVersion: "1.2.0", updateSize: 13 }), async (p) => { eq(p.$("upd_text").textContent, "Version 1.2.0 (13 MB)"); });
+      await withPage(UP({ updateSize: null }), async (p) => { eq(p.$("upd_text").textContent, "Version 0.1.9"); });
+    });
+
+    await test("updater: Later hides the card, and a refresh does not bring it back", () => withPage(UP({ isDefault: false }), async (p) => {
+      await p.click(p.$("upd_later"));
+      ok(!p.visible(p.$("updcard")), "hidden");
+      await p.win.GLStart.refresh();
+      ok(!p.visible(p.$("updcard")), "still hidden after refresh");
+      ok(p.visible(p.$("defcard")), "default card unaffected");
+      eq(p.cmds("update_download").length, 0);
+    }));
+
+    await test("updater: tapping Update disables the button, shows progress from update_progress, then installs", () => withPage(UP({
+      downloadHold: true, progress: [{ done: 50, total: 200 }, { done: 100, total: 200 }],
+    }), async (p) => {
+      await p.click(p.$("upd_go"));
+      const g = p.$("upd_go");
+      eq(g.textContent, "Downloading" + ELL + " 0 %");
+      ok(g.disabled, "button disabled");
+      eq(p.cmds("update_download").length, 1);
+      eq(p.fake.timers.length, 1, "one poll timer running");
+      eq(p.fake.timers[0].ms, 500, "polls every 500 ms");
+      await p.tick();
+      eq(g.textContent, "Downloading" + ELL + " 25 %", "first reading");
+      await p.tick();
+      eq(g.textContent, "Downloading" + ELL + " 50 %", "second reading");
+      eq(p.cmds("update_progress").length, 2, "one update_progress call per tick");
+      ok(g.disabled, "still disabled");
+      eq(p.cmds("update_install").length, 0, "not installed before the download ends");
+      p.fake.st.finishDownload();
+      await sleep(60);
+      eq(p.cmds("update_install").length, 1, "install called once");
+      eq(p.$("upd_text").textContent, "Follow Android's prompt to install. Your files and settings stay.");
+      eq(cardBtns(p).join("|"), "Later", "no Install button when Android opened its installer");
+      eq(p.fake.timers.length, 0, "poll timer stopped");
+    }));
+
+    await test("updater: total 0 or a bad reading shows 0 %, and a reading above total stops at 100 %", async () => {
+      await withPage(UP({ downloadHold: true, progress: [{ done: 10, total: 0 }] }), async (p) => {
+        await p.click(p.$("upd_go"));
+        await p.tick();
+        eq(p.$("upd_go").textContent, "Downloading" + ELL + " 0 %");
+      });
+      await withPage(UP({ downloadHold: true, progress: [{ done: 900, total: 300 }] }), async (p) => {
+        await p.click(p.$("upd_go"));
+        await p.tick();
+        eq(p.$("upd_go").textContent, "Downloading" + ELL + " 100 %");
+      });
+    });
+
+    await test("updater: a second tap on Update while downloading does nothing", () => withPage(UP({ downloadHold: true }), async (p) => {
+      await p.click(p.$("upd_go"));
+      await p.click(p.$("upd_go"));
+      eq(p.cmds("update_download").length, 1);
+    }));
+
+    await test("updater: install answers opened:false -> allow text and an Install button; Install asks again", () => withPage(UP({ installOpened: [false, true] }), async (p) => {
+      await p.click(p.$("upd_go"));
+      await sleep(60);
+      eq(p.$("upd_text").textContent, "Allow Greenline to install updates in the screen that opened, then tap Install.");
+      eq(cardBtns(p).join("|"), "Later|Install");
+      ok(!p.$("upd_go").disabled, "Install is tappable");
+      eq(p.cmds("update_install").length, 1);
+      await p.click(p.$("upd_go"));
+      eq(p.cmds("update_install").length, 2, "second install call");
+      eq(p.cmds("update_download").length, 1, "no second download");
+      eq(p.$("upd_text").textContent, "Follow Android's prompt to install. Your files and settings stay.");
+      eq(cardBtns(p).join("|"), "Later");
+    }));
+
+    await test("updater: opened:false again keeps the allow text and the Install button", () => withPage(UP({ installOpened: false }), async (p) => {
+      await p.click(p.$("upd_go"));
+      await sleep(60);
+      await p.click(p.$("upd_go"));
+      eq(p.$("upd_text").textContent, "Allow Greenline to install updates in the screen that opened, then tap Install.");
+      eq(cardBtns(p).join("|"), "Later|Install");
+    }));
+
+    await test("updater: every error code maps to its sentence, offers Try again, and never shows raw text", async () => {
+      const want = {
+        E_UPDATE_NETWORK: "No connection. Try again later.",
+        E_UPDATE_SIGNATURE: "The download failed the safety check and was deleted.",
+        E_UPDATE_BAD_RELEASE: "Update failed (E_UPDATE_BAD_RELEASE).",
+        E_UPDATE_SIZE: "Update failed (E_UPDATE_SIZE).",
+        E_UPDATE_NO_DOWNLOAD: "Update failed (E_UPDATE_NO_DOWNLOAD).",
+        E_UPDATE_BUSY: "Update failed (E_UPDATE_BUSY).",
+        E_UPDATE_FAILED: "Update failed (E_UPDATE_FAILED).",
+        E_UPDATE_UNSUPPORTED: "Update failed (E_UPDATE_UNSUPPORTED).",
+      };
+      // One page, one Try again per case: the stub rejects with the next value on each download.
+      const raws = [new Error("raw SENTINEL /storage/emulated/0/x.pdf"), "raw SENTINEL text", { message: "SENTINEL" }, "e_update_network"];
+      const codes = Object.keys(want);
+      await withPage(UP({ downloadReject: codes.concat(raws) }), async (p) => {
+        for (let i = 0; i < codes.length + raws.length; i++) {
+          await p.click(p.$("upd_go"));
+          await sleep(20);
+          const label = i < codes.length ? codes[i] : "raw " + i;
+          eq(p.$("upd_text").textContent, i < codes.length ? want[codes[i]] : "Update failed (E_UPDATE_FAILED).", label);
+          eq(cardBtns(p).join("|"), "Later|Try again", label);
+          ok(!p.$("upd_go").disabled, "Try again is tappable");
+          ok(p.doc.body.textContent.indexOf("SENTINEL") < 0, "no raw text anywhere");
+        }
+        eq(p.cmds("update_download").length, codes.length + raws.length);
+        eq(p.cmds("update_install").length, 0, "no install after a failed download");
+      });
+    });
+
+    await test("updater: an error stops the progress polling", () => withPage(UP({ downloadHold: true, progress: [{ done: 1, total: 4 }] }), async (p) => {
+      await p.click(p.$("upd_go"));
+      await p.tick();
+      eq(p.$("upd_go").textContent, "Downloading" + ELL + " 25 %");
+      p.fake.st.failDownload("E_UPDATE_NETWORK");
+      await sleep(60);
+      eq(p.fake.timers.length, 0, "poll timer stopped");
+      eq(p.$("upd_text").textContent, "No connection. Try again later.");
+    }));
+
+    await test("updater: Try again restarts the download, and a success then installs", () => withPage(UP({ downloadHold: true }), async (p) => {
+      await p.click(p.$("upd_go"));
+      p.fake.st.failDownload("E_UPDATE_NETWORK");
+      await sleep(60);
+      eq(p.$("upd_go").textContent, "Try again");
+      await p.click(p.$("upd_go"));
+      eq(p.cmds("update_download").length, 2, "downloaded again");
+      eq(p.$("upd_go").textContent, "Downloading" + ELL + " 0 %");
+      p.fake.st.finishDownload();
+      await sleep(60);
+      eq(p.cmds("update_install").length, 1);
+      eq(p.$("upd_text").textContent, "Follow Android's prompt to install. Your files and settings stay.");
+    }));
+
+    await test("updater: a failing install shows the error sentence with Try again", async () => {
+      await withPage(UP({ installReject: "E_UPDATE_NO_DOWNLOAD" }), async (p) => {
+        await p.click(p.$("upd_go"));
+        await sleep(60);
+        eq(p.$("upd_text").textContent, "Update failed (E_UPDATE_NO_DOWNLOAD).");
+        eq(cardBtns(p).join("|"), "Later|Try again");
+      });
+      await withPage(UP({ installReject: new Error("raw SENTINEL") }), async (p) => {
+        await p.click(p.$("upd_go"));
+        await sleep(60);
+        eq(p.$("upd_text").textContent, "Update failed (E_UPDATE_FAILED).");
+        ok(p.doc.body.textContent.indexOf("SENTINEL") < 0, "no raw text");
+      });
+    });
+
+    await test("updater: Later after the installer opened hides the card", () => withPage(UP(), async (p) => {
+      await p.click(p.$("upd_go"));
+      await sleep(60);
+      await p.click(p.$("upd_later"));
+      ok(!p.visible(p.$("updcard")), "hidden");
+    }));
+
+    await test("updater: at 360 px every card button is at least 48 px tall and nothing overflows, in every state", () => withPage(UP({
+      width: 360, isDefault: false, recents: R(3), downloadHold: true, progress: [{ done: 100, total: 100 }], installOpened: [false, true],
+    }), async (p) => {
+      const check = (label) => {
+        const bs = p.qa("#updcard button").filter((b) => p.visible(b));
+        ok(bs.length >= 1, label + ": buttons visible");
+        for (const b of bs) {
+          const r = p.rect(b);
+          ok(r.height >= 48 && r.width >= 48, label + ": " + b.textContent + " is " + r.width + "x" + r.height);
+        }
+        const de = p.doc.documentElement;
+        ok(de.scrollWidth <= de.clientWidth, label + ": scrollWidth " + de.scrollWidth);
+        for (const el of p.qa("#updcard, #updcard *")) {
+          const r = p.rect(el);
+          if (r.width === 0) continue;
+          ok(r.left >= -0.5 && r.right <= 360.5, label + ": " + el.tagName + "#" + el.id + " spans " + r.left + ".." + r.right);
+        }
+      };
+      check("offer");
+      await p.click(p.$("upd_go"));
+      check("downloading");
+      eq(p.$("upd_go").textContent, "Downloading" + ELL + " 0 %");
+      p.fake.st.finishDownload();
+      await sleep(60);
+      check("allow");
+      eq(p.$("upd_go").textContent, "Install");
+      await p.click(p.$("upd_go"));
+      check("opened");
+    }));
+
+    await test("updater: error state fits 360 px with buttons of at least 48 px", () => withPage(UP({ width: 360, downloadReject: "E_UPDATE_SIGNATURE" }), async (p) => {
+      await p.click(p.$("upd_go"));
+      await sleep(60);
+      for (const b of p.qa("#updcard button").filter((x) => p.visible(x))) {
+        const r = p.rect(b);
+        ok(r.height >= 48, b.textContent + " is " + r.height + " px tall");
+        ok(r.right <= 360.5 && r.left >= -0.5, b.textContent + " spans " + r.left + ".." + r.right);
+      }
+      const t = p.rect(p.$("upd_text"));
+      ok(t.right <= 360.5, "text inside the screen");
     }));
 
     await test("About works at 360 px with no horizontal scroll", () => withPage({ recents: [], width: 360 }, async (p) => {
