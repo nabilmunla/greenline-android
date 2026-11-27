@@ -438,7 +438,7 @@
 
   function openSettings() {
     if (!openSheet("settings", "settings", "settings_close")) return;
-    if (!manualBusy) $("upd_status").hidden = true;
+    if (!manualBusy) { $("upd_status").hidden = true; $("upd_set_go").hidden = true; }
     syncSettings();
   }
 
@@ -631,6 +631,7 @@
     const st = $("upd_status");
     $("upd_check").disabled = true;
     st.textContent = "Checking\u2026";
+    $("upd_set_go").hidden = true;
     st.hidden = false;
     try {
       const r = await runCheck();
@@ -639,6 +640,7 @@
       } else if (r.available) {
         st.textContent = r.version ? "Version " + r.version + " is available." : "A new version is available.";
         offerUpdate(r);
+        $("upd_set_go").hidden = false;
       } else {
         st.textContent = "You have the latest version.";
       }
@@ -679,6 +681,8 @@
     $("upd_off").addEventListener("click", () => setUpdateCheck("off"));
     $("upd_check").addEventListener("click", checkNow);
     $("upd_later").addEventListener("click", dismissUpdateCard);
+    // Settings "Update": back to the start screen, where the card shows the download and Install.
+    $("upd_set_go").addEventListener("click", () => { closeSettings(false); startUpdate(); });
     $("upd_go").addEventListener("click", () => { if (updGo) updGo(); });
     $("d_info").addEventListener("click", engineInfo);
     $("d_measure").addEventListener("click", () => { location.href = "measure.html"; });

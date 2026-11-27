@@ -232,7 +232,8 @@
       eq(rows[1].querySelector("p").textContent, "Once a day, Greenline asks GitHub whether a newer version is out. Nothing else is sent.");
       eq(Array.from(rows[1].querySelectorAll(".seg button")).map((b) => b.textContent).join("|"), "On|Off");
       eq(p.$("upd_check").textContent, "Check now");
-      eq(p.qa("#settings button").length, 6, "close + two + two choices + Check now, nothing else");
+      eq(Array.from(p.qa("#settings button")).filter((b) => p.visible(b)).length, 6, "close + two + two choices + Check now, nothing else");
+      ok(!p.visible(p.$("upd_set_go")), "no Update button before a check");
       ok(!p.visible(p.$("upd_status")), "no status line before a check");
     }));
 
@@ -397,6 +398,33 @@
       eq(p.$("upd_text").textContent, "Version 0.1.9 (13.1 MB)");
       eq(Array.from(p.qa("#updcard button")).map((b) => b.textContent).join("|"), "Later|Update");
     }));
+
+    await test("Check now: update found -> an Update button in Settings closes Settings and starts the download", () => withPage({ updateAvailable: true }, null, async (p) => {
+      await p.openSettings();
+      ok(!p.visible(p.$("upd_set_go")), "no Update button before a check");
+      await p.click(p.$("upd_check"));
+      ok(p.visible(p.$("upd_set_go")), "Update button shown");
+      eq(p.$("upd_set_go").textContent, "Update");
+      const r = p.rect(p.$("upd_set_go"));
+      ok(r.height >= 48, "button is " + r.height + " px tall");
+      ok(r.top >= p.rect(p.status()).bottom, "button sits under the status line");
+      await p.click(p.$("upd_set_go"));
+      ok(!p.visible(p.$("settings")), "Settings closed");
+      ok(p.visible(p.$("updcard")), "card on the start screen");
+      eq(p.cmds("update_download").length, 1, "download started");
+      await p.openSettings();
+      ok(!p.visible(p.$("upd_set_go")), "button cleared when Settings opens again");
+    }));
+
+    await test("Check now: no Update button when there is no update or the check fails", async () => {
+      for (const o of [{}, { updateCheckReject: "E_UPDATE_NETWORK" }]) {
+        await withPage(o, null, async (p) => {
+          await p.openSettings();
+          await p.click(p.$("upd_check"));
+          ok(!p.visible(p.$("upd_set_go")), "no Update button");
+        });
+      }
+    });
 
     await test("Check now: failure -> Could not check (CODE). and nothing raw", async () => {
       for (const [rej, code] of [["E_UPDATE_NETWORK", "E_UPDATE_NETWORK"], ["E_UPDATE_UNSUPPORTED", "E_UPDATE_UNSUPPORTED"], [new Error("raw SENTINEL /storage/emulated/0/x.pdf"), "E_UPDATE_FAILED"], ["raw SENTINEL text", "E_UPDATE_FAILED"]]) {
