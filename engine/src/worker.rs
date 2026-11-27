@@ -628,6 +628,7 @@ impl Worker {
                     self.doc = None;
                     self.direct = None;
                     self.latest_gen = 0;
+                    self.reset_region_floor();
                     mem::trim();
                 }
                 Request::ShowPage { page, fit_width } => self.show_page(page, fit_width),
@@ -694,6 +695,13 @@ impl Worker {
 
     fn error(&self, code: ErrorCode, tile: Option<u64>) {
         self.emit(Event::Error { code, tile });
+    }
+
+    /// A new document starts its region gens again at 0 (the viewer's counter restarts on a reload), so
+    /// the floor left by the previous one must go (DS2.1). Done here, in queue order: regions queued
+    /// before the Open/Close keep their old floor, and every region sent after it is compared afresh.
+    fn reset_region_floor(&self) {
+        self.shared.region_floor.store(0, SeqCst);
     }
 
     /// A newer sharp-view region has been sent (or the viewer dropped this one).
@@ -858,6 +866,7 @@ impl Worker {
         self.doc = None;
         self.direct = None;
         self.latest_gen = 0;
+        self.reset_region_floor();
         mem::trim();
         match Doc::open(path) {
             Ok(d) => {

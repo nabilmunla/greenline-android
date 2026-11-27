@@ -280,7 +280,7 @@ pub fn direct_fit(doc: &Doc, page: i32, width: u32, cookie: &Cookie) -> crate::R
 pub fn direct_fit_bounds(doc: &Doc, page: i32, width: u32, cookie: &Cookie) -> crate::Result<(Rendered, Bounds)> {
     let (p, b, load_ms) = doc.load(page)?;
     let s = crate::fit_scale(&b, width)?;
-    let r = crate::fit_irect(&b, s);
+    let r = crate::fit_irect(&b, s)?;
     let t = Instant::now();
     let mut pm = Pixmap::new_with_rect(&doc.rgb, r, false)?;
     pm.clear_with(255)?;

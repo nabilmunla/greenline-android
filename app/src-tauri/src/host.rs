@@ -137,6 +137,8 @@ impl Host {
                 None => return false,
             }
         };
+        lock(&self.images).items.clear();
+        *lock(&self.direct) = None;
         self.client.cancel();
         self.client.send(Request::Close);
         // Fence: any tile is answered exactly once (here: NoDocument or skipped), and only after the
@@ -299,6 +301,13 @@ struct ErrorMsg {
     code: u16,
 }
 
+/// `gl-error` when the engine thread has gone: the fixed code instead of an `ErrorCode` number.
+#[derive(Clone, Serialize)]
+struct EngineGoneMsg {
+    doc: u64,
+    code: &'static str,
+}
+
 #[derive(Clone, Serialize)]
 struct DroppedMsg {
     doc: u64,
@@ -369,6 +378,7 @@ pub fn start(app: AppHandle) -> std::io::Result<Arc<Host>> {
             h.dispatch(&app, ev);
         }
         h.engine_gone();
+        emit(&app, "gl-error", EngineGoneMsg { doc: h.doc(), code: "E_ENGINE" });
     })?;
     Ok(host)
 }

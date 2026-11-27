@@ -338,3 +338,21 @@ fn set_pdf_page_count_and_walk() {
     let d = doc.render_tile(1000, TILE_ZOOM, 1, 1).unwrap();
     assert_near("set page 1001 tile", &d.image, &t.image);
 }
+
+/// DS2.2 (sweep 0.1.11 #2): the fit image of a very tall page is scaled down to stay within
+/// FIT_MAX_PX pixels and FIT_MAX_SIDE per side, instead of following the width alone (a 100 x 3000 pt
+/// page at 1600 px wide was 1600 x 48,000 = 77 Mpx, about 300 MB of RGBA). Both fit paths agree.
+#[test]
+fn tall_page_fit_is_bounded() {
+    let doc = Doc::open(common::pdf_with_pages("tall.pdf", &[(100, 3000), (3370, 2384)])).unwrap();
+    let a = doc.render_fit(0, FIT_WIDTH).unwrap().image;
+    let (w, h) = (a.width as u64, a.height as u64);
+    eprintln!("  tall page fit: {w} x {h}");
+    assert!(w * h <= greenline_engine::FIT_MAX_PX, "{w} x {h} is over FIT_MAX_PX");
+    assert!(h <= greenline_engine::FIT_MAX_SIDE as u64 && w <= greenline_engine::FIT_MAX_SIDE as u64, "{w} x {h}");
+    assert!(non_white(&a) > 0, "the page is drawn");
+    let list = doc.build_display_list(0).unwrap().list.render_fit_cookie(FIT_WIDTH, None).unwrap().image;
+    assert_eq!((list.width, list.height), (a.width, a.height), "list and direct fit differ");
+    // An ordinary landscape sheet is unchanged: exactly FIT_WIDTH wide.
+    assert_eq!(doc.render_fit(1, FIT_WIDTH).unwrap().image.width, FIT_WIDTH);
+}

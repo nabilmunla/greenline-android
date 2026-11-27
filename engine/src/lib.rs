@@ -46,6 +46,10 @@ pub use mupdf::Cookie;
 
 /// Width of the whole-page fit view, in pixels (glspike `FIT_W`).
 pub const FIT_WIDTH: u32 = 1600;
+/// Most pixels in a fit image (DS2.2): 16 Mpx, the same as the largest region (4096 x 4096).
+pub const FIT_MAX_PX: u64 = 16 << 20;
+/// Longest side of a fit image (DS2.2): a margin for the WebView, not a measured limit.
+pub const FIT_MAX_SIDE: u32 = 16384;
 /// Tile edge, in pixels (glspike `TILE`). Tiles are always `TILE_SIZE` x `TILE_SIZE`.
 pub const TILE_SIZE: u32 = 1024;
 /// The 400 % zoom glspike measured (glspike `ZOOM`).
@@ -427,7 +431,7 @@ impl DisplayList {
     pub fn render_fit_cookie(&self, width: u32, cookie: Option<&Cookie>) -> Result<Rendered> {
         let b = self.bounds;
         let s = fit_scale(&b, width)?;
-        let r = fit_irect(&b, s);
+        let r = fit_irect(&b, s)?;
         let rgb = Colorspace::device_rgb();
         let t = Instant::now();
         let mut pm = Pixmap::new_with_rect(&rgb, r, false)?;
@@ -486,11 +490,33 @@ impl DisplayList {
 // ---------------------------------------------------------------------------------------------
 // helpers
 
+/// Scale for a fit image `width` px wide, lowered when needed so the image stays within
+/// [`FIT_MAX_PX`] pixels and [`FIT_MAX_SIDE`] per side (DS2.2: a very tall page would otherwise follow
+/// the width alone into hundreds of MB). A page with no usable size is an error, not a panic (#20).
 fn fit_scale(b: &Bounds, width: u32) -> Result<f32> {
     if width == 0 {
         return Err(Error::Invalid("fit width is 0"));
     }
-    Ok(width as f32 / b.width())
+    let (bw, bh) = (b.width() as f64, b.height() as f64);
+    let finite = [b.x0, b.y0, b.x1, b.y1].iter().all(|v| v.is_finite());
+    if !(finite && bw > 0.0 && bh > 0.0) {
+        return Err(Error::Invalid("page has no usable size"));
+    }
+    let mut s = width as f64 / bw;
+    // A hair under each limit, so MuPDF's outward rounding of the bbox stays inside it.
+    let px = (bw * s) * (bh * s);
+    if px > FIT_MAX_PX as f64 {
+        s *= (FIT_MAX_PX as f64 / px).sqrt() * 0.999;
+    }
+    let side = FIT_MAX_SIDE as f64 - 2.0;
+    if bw.max(bh) * s > side {
+        s = side / bw.max(bh);
+    }
+    let s = s as f32;
+    if !(s.is_finite() && s > 0.0) {
+        return Err(Error::Invalid("page has no usable size"));
+    }
+    Ok(s)
 }
 
 fn check_zoom(zoom: f32) -> Result<()> {
@@ -502,13 +528,26 @@ fn check_zoom(zoom: f32) -> Result<()> {
 
 /// The pixel rect MuPDF gives `Page::to_pixmap` for a scale-only matrix (`fz_round_rect` of the
 /// transformed bounds), so list renders have exactly the size and origin of direct renders.
-fn fit_irect(b: &Bounds, s: f32) -> IRect {
-    IRect {
-        x0: (b.x0 * s + 0.001).floor() as i32,
-        y0: (b.y0 * s + 0.001).floor() as i32,
-        x1: (b.x1 * s - 0.001).ceil() as i32,
-        y1: (b.y1 * s - 0.001).ceil() as i32,
+/// An origin too far out for i32 pixels, or an empty rect, is an error (#20), not a saturated or
+/// zero-width pixmap.
+fn fit_irect(b: &Bounds, s: f32) -> Result<IRect> {
+    let px = |v: f32| -> Result<i32> {
+        if v.is_finite() && v.abs() < (1u32 << 30) as f32 {
+            Ok(v as i32)
+        } else {
+            Err(Error::Invalid("page origin out of range"))
+        }
+    };
+    let r = IRect {
+        x0: px((b.x0 * s + 0.001).floor())?,
+        y0: px((b.y0 * s + 0.001).floor())?,
+        x1: px((b.x1 * s - 0.001).ceil())?,
+        y1: px((b.y1 * s - 0.001).ceil())?,
+    };
+    if r.x1 <= r.x0 || r.y1 <= r.y0 {
+        return Err(Error::Invalid("page has no usable size"));
     }
+    Ok(r)
 }
 
 fn irect_to_rect(r: IRect) -> Rect {
@@ -590,7 +629,40 @@ mod tests {
     fn fit_irect_rounds_like_mupdf() {
         let b = Bounds { x0: 0.0, y0: 0.0, x1: 3370.0, y1: 2384.0 };
         let s = 1600.0 / 3370.0;
-        let r = fit_irect(&b, s);
+        let r = fit_irect(&b, s).unwrap();
         assert_eq!((r.x0, r.y0, r.x1), (0, 0, 1600));
+        // DS2.2: an ordinary sheet keeps exactly the asked width.
+        let r = fit_irect(&b, fit_scale(&b, 1600).unwrap()).unwrap();
+        assert_eq!((r.x0, r.y0, r.x1), (0, 0, 1600));
+    }
+
+    #[test]
+    fn fit_of_a_tall_page_stays_within_the_limits() {
+        for (w, h) in [(100.0f32, 3000.0f32), (1.0, 8000.0), (3000.0, 100.0), (14400.0, 14400.0)] {
+            let b = Bounds { x0: 0.0, y0: 0.0, x1: w, y1: h };
+            let r = fit_irect(&b, fit_scale(&b, 1600).unwrap()).unwrap();
+            let (pw, ph) = ((r.x1 - r.x0) as u64, (r.y1 - r.y0) as u64);
+            assert!(pw * ph <= FIT_MAX_PX && pw.max(ph) <= FIT_MAX_SIDE as u64, "{w} x {h} pt gave {pw} x {ph}");
+            assert!(pw > 0 && ph > 0);
+        }
+        // Up to 6.5 times taller than wide, nothing changes at 1600.
+        let b = Bounds { x0: 0.0, y0: 0.0, x1: 1000.0, y1: 6500.0 };
+        assert_eq!(fit_irect(&b, fit_scale(&b, 1600).unwrap()).unwrap().x1, 1600);
+    }
+
+    #[test]
+    fn fit_of_a_page_with_no_usable_size_is_an_error() {
+        let bad = [
+            Bounds { x0: 0.0, y0: 0.0, x1: 0.0, y1: 792.0 },
+            Bounds { x0: 0.0, y0: 0.0, x1: 612.0, y1: 0.0 },
+            Bounds { x0: 0.0, y0: 0.0, x1: f32::INFINITY, y1: 792.0 },
+            Bounds { x0: 0.0, y0: 0.0, x1: f32::NAN, y1: 792.0 },
+            Bounds { x0: 10.0, y0: 0.0, x1: 5.0, y1: 792.0 },
+        ];
+        for b in bad {
+            assert!(fit_scale(&b, 1600).is_err(), "{:?}", (b.x0, b.y0, b.x1, b.y1));
+        }
+        let far = Bounds { x0: 1e9, y0: 0.0, x1: 1e9 + 612.0, y1: 792.0 };
+        assert!(fit_scale(&far, 1600).and_then(|s| fit_irect(&far, s)).is_err());
     }
 }

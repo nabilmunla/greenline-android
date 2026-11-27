@@ -297,6 +297,7 @@
     }
     await step({ step: "walk", walked, ms: r1(now() - t0), max_ms: r1(maxMs), cancelled },
       "Walk: " + walked + " of " + n + " pages" + (cancelled ? " (cancelled)" : "") + ", slowest " + f0(maxMs) + " ms");
+    return cancelled;
   }
 
   async function runFile() {
@@ -336,7 +337,7 @@
       await tiles(plan);
       await refill(plan);
       await pages(plan, start.fit_width);
-      if ($("walk").checked) await walk(start.pages, start.fit_width);
+      if ($("walk").checked && await walk(start.pages, start.fit_width)) cancelled = true;
     } catch (e) {
       // A cancel also aborts the tile fetches in flight (an AbortError, not a Stop). Only a cancel is
       // reported as cancelled; any other failure ends the run as a failed step.
@@ -408,6 +409,10 @@
     if (st.recovered.length) {
       $("recovered").textContent = "The last run of " + st.recovered.join(", ") +
         " did not finish (the app was probably killed): recorded as a probable kill.";
+      $("recovered").hidden = false;
+    }
+    if (st.recover_error) {
+      $("recovered").textContent = "Could not check the saved results for an unfinished run (" + codeOf(st.recover_error) + ").";
       $("recovered").hidden = false;
     }
     const m = st.marks;

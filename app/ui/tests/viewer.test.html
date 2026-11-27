@@ -91,6 +91,7 @@
           return Promise.resolve({ doc: 1, pages: pages, open_ms: 5, size_mb: 1, seekable: true, kind: "pdf" });
         case "show_page":
           V.shown.push(args.page);
+          if (V.engineDead) return Promise.resolve(false); // the host's answer when the engine thread is gone
           setTimeout(() => {
             const f = V.listeners["gl-image"];
             if (f) f({ payload: { doc: 1, page: args.page, kind: "fit", id: args.page + 1, pt_w: 600, pt_h: 800 } });
@@ -153,6 +154,7 @@
     for (let i = 0; i < 150 && !(w.GLViewer && w.GLPrefs); i++) await sleep(20);
     if (!(w.GLViewer && w.GLPrefs)) throw new Error("viewer.js did not load");
     if (o.dir) w.GLPrefs.set("pageDirection", o.dir);
+    V.engineDead = !!o.engineDead;
     const p = { V, iframe, win: w, doc: w.document };
     p.$ = (id) => w.document.getElementById(id);
     p.canvas = p.$("canvas");
@@ -199,7 +201,7 @@
     p.tap = (x, y) => { p.down(x, y); V.t += 40; ev("pointerup", x, y); };
 
     await w.GLViewer.open({ kind: "picker" }, 0);
-    await p.shows(0);
+    if (!o.engineDead) await p.shows(0);
     return p;
   }
   async function withViewer(o, fn) {
@@ -518,6 +520,70 @@
       p.idle();
       await sleep(30);
       eq(p.px(90, 250).slice(0, 2), "p0", "page 1 is back at rest");
+    }));
+
+    // ---------------------------------------------------------------- DS2.3
+    // Leave the viewer the way Android Back does (the popstate exit); the document stays open.
+    const leave = (p) => p.win.dispatchEvent(new p.win.PopStateEvent("popstate"));
+
+    await test("DS2.3 #6: rotated while the viewer is hidden, resumed at fit: the page is refitted and a swipe changes page", () => withViewer({ dir: "vertical" }, async (p) => {
+      leave(p);
+      ok(p.$("viewer").hidden, "the viewer is hidden after Back");
+      p.iframe.style.width = "740px"; // portrait 360 x 740 -> landscape 740 x 360
+      p.iframe.style.height = "360px";
+      ok(p.win.GLViewer.resume(), "resume");
+      p.idle();
+      // Fit for a 600 x 800 pt page in 740 x 360 is 0.45: the page is 270 px wide, centred at x 235..505.
+      eq(p.px(490, 180).slice(0, 2), "p0", "page covers (490,180) at the new fit");
+      eq(p.px(520, 180), "bg", "page ends at x 505, so (520,180) is background (an old-scale page would cover it)");
+      eq(p.px(220, 180), "bg", "and (220,180) is background");
+      p.drag([370, 300], [370, 100]); // a swipe at fit changes page (it only pans when the view counts as zoomed)
+      p.idle();
+      await sleep(30);
+      eq(p.page(), 1, "page after the swipe");
+    }));
+
+    await test("DS2.3 #6: rotated while hidden but zoomed in: stays zoomed (clamped), the swipe pans and does not change page", () => withViewer({ dir: "vertical" }, async (p) => {
+      p.tap(180, 370);
+      p.V.t += 100;
+      p.tap(180, 370); // double tap: zoom to 400 %
+      p.idle();
+      leave(p);
+      p.iframe.style.width = "740px";
+      p.iframe.style.height = "360px";
+      ok(p.win.GLViewer.resume(), "resume");
+      p.idle();
+      p.drag([370, 300], [370, 100]);
+      p.idle();
+      await sleep(30);
+      eq(p.page(), 0, "zoomed: no page change");
+      eq(p.V.shown.join(","), "0", "no show_page");
+    }));
+
+    await test("DS2.3 #16: leaving the viewer in the middle of a page slide stops it: no show_page for the next page, same page", () => withViewer({ dir: "vertical" }, async (p) => {
+      p.drag([180, 600], [180, 300]); // the slide-out to page 2 starts
+      p.V.step(40);
+      leave(p);
+      ok(p.$("viewer").hidden, "the viewer is hidden");
+      p.idle();
+      p.V.step(400);
+      await sleep(30);
+      eq(p.V.shown.join(","), "0", "no show_page for the next page");
+      eq(p.page(), 0, "the page number is unchanged");
+      ok(p.win.GLViewer.resume(), "resume");
+      p.idle();
+      eq(p.px(90, 250).slice(0, 2), "p0", "back in the viewer, page 1 is at rest (not left half-way out)");
+    }));
+
+    // ---------------------------------------------------------------- DS2.4
+    await test("DS2.4 #7: show_page answers false (engine gone): the message shows and the overlay stops waiting", () => withViewer({ engineDead: true }, async (p) => {
+      await sleep(30);
+      ok(!p.$("vmsg").hidden, "the message is shown");
+      eq(p.$("vmsg_t").textContent, "Engine not available");
+      ok(!p.$("vmsg_retry").hidden, "with a retry button");
+      p.V.t += 2000; // the overlay would show after 500 ms of waiting
+      await sleep(300); // the overlay's own timer (250 ms) runs
+      ok(p.$("overlay").hidden, "the overlay is not waiting for an image that will never come");
     }));
   }
 

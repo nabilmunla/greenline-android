@@ -295,6 +295,56 @@
       eq(p.fake.calls.open.filter((o) => o.source.kind === "incoming").length, 2);
     }));
 
+    // A fake viewer whose open guard is held by an incoming check that the test ends by hand: any other open
+    // answers null (the viewer's "busy" answer) while that check is pending, as GLViewer.open does.
+    function heldCheck() {
+      const h = { hold: false, pending: null, opened: 0 };
+      h.open = (s) => {
+        if (s.kind === "incoming") {
+          if (!h.hold) return { error: "E_NONE" };
+          return new Promise((res) => { h.pending = res; });
+        }
+        if (h.pending) return null;
+        h.opened++;
+        return { pages: 12 };
+      };
+      h.end = (answer) => { const r = h.pending; h.pending = null; r(answer); };
+      return h;
+    }
+
+    await test("DS2.5 #19: a tap on a Recent row while the incoming check holds the open guard waits for the check and opens it again", () => {
+      const h = heldCheck();
+      return withPage({ recents: R(3), open: h.open }, async (p) => {
+        h.hold = true;
+        p.win.GLStart.checkIncoming();
+        await sleep(20);
+        ok(h.pending, "the incoming check is running");
+        await p.click(p.rows()[1].querySelector(".pick"));
+        eq(p.fake.calls.open.filter((o) => o.source.kind === "recent").length, 1, "the tap reached the viewer once");
+        h.end({ error: "E_NONE" });
+        await sleep(60);
+        const rec = p.fake.calls.open.filter((o) => o.source.kind === "recent");
+        eq(rec.length, 2, "open was called again with the recent");
+        eq(JSON.stringify(rec[1].source), JSON.stringify({ kind: "recent", id: "id2" }));
+        eq(rec[1].startPage, 1, "with the same start page");
+        eq(h.opened, 1, "and it opened");
+      });
+    });
+
+    await test("DS2.5 #19: the incoming check opened a file: the tapped Recent is not opened over it", () => {
+      const h = heldCheck();
+      return withPage({ recents: R(3), open: h.open }, async (p) => {
+        h.hold = true;
+        p.win.GLStart.checkIncoming();
+        await sleep(20);
+        await p.click(p.rows()[1].querySelector(".pick"));
+        h.end({ pages: 3 });
+        await sleep(60);
+        eq(p.fake.calls.open.filter((o) => o.source.kind === "recent").length, 1, "no retry");
+        eq(h.opened, 0, "the Recent did not open");
+      });
+    });
+
     await test("incoming error shows a friendly message", () => withPage({
       recents: [], open: (s) => (s.kind === "incoming" ? { error: "E_OPEN_FAILED" } : { pages: 1 }),
     }, async (p) => {

@@ -32,8 +32,13 @@ pub fn corpus(name: &str) -> Option<PathBuf> {
 /// A small 3-page PDF written to the target tmp dir: always available, so the API is exercised even
 /// without the corpus. Page 1 and 3 are 612 x 792, page 2 is 842 x 595 (landscape). Graphics only.
 pub fn tiny_pdf() -> PathBuf {
-    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join("tiny.pdf");
-    let sizes = [(612, 792), (842, 595), (612, 792)];
+    pdf_with_pages("tiny.pdf", &[(612, 792), (842, 595), (612, 792)])
+}
+
+/// A small PDF with one page per `(width, height)` in points, each with the same simple drawing
+/// (a filled box, a diagonal line, a small square), written to the test tmp dir as `name`.
+pub fn pdf_with_pages(name: &str, sizes: &[(u32, u32)]) -> PathBuf {
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
     let mut out: Vec<u8> = b"%PDF-1.4\n".to_vec();
     let mut offs: Vec<usize> = Vec::new();
     let n_objs = 2 + sizes.len() * 2;
@@ -70,7 +75,7 @@ pub fn tiny_pdf() -> PathBuf {
         out.extend_from_slice(format!("{o:010} 00000 n \n").as_bytes());
     }
     out.extend_from_slice(format!("trailer\n<< /Size {} /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n", n_objs + 1).as_bytes());
-    std::fs::write(&path, out).expect("write tiny.pdf");
+    std::fs::write(&path, out).expect("write test pdf");
     path
 }
 

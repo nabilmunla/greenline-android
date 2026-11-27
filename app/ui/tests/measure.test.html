@@ -50,16 +50,22 @@
   }
 
   // A fake app: records every invoke, keeps the event listeners so the test can emit engine events.
-  function makeFake() {
+  function makeFake(state) {
     const st = { calls: [], listeners: {} };
     function invoke(cmd, args) {
       st.calls.push({ cmd: cmd, args: args });
       switch (cmd) {
         case "measure_state":
-          return Promise.resolve({
+          return Promise.resolve(Object.assign({
             used: [], next_label: 0, recovered: [], records: 0, summary: "[]",
             marks: { first_view_ms: 1000, first_view_labels: ["f00"], tile_ms: 1000, refill_ms: 1000, page_ms: 100, peak_mb: 1024 },
-          });
+          }, state || {}));
+        case "measure_plan": // no tiles, no refill, no spread pages: the run goes straight from the first view to the walk
+          return Promise.resolve({ zoom: 4, tiles: [], refill: [], pages: [], view_x0: 0, view_y0: 0 });
+        case "measure_step":
+          return Promise.resolve({ rss_mb: 100, hwm_mb: 120, direct: false });
+        case "show_page": // never answered with an image: the test emits the events it wants
+          return Promise.resolve(true);
         case "measure_start":
           return Promise.resolve({ doc: 7, pages: 3, fit_width: 400, since_fd_ms: 5 });
         case "measure_end":
@@ -76,17 +82,23 @@
     };
     st.emit = (name, payload) => st.listeners[name]({ payload: payload });
     st.cmds = (c) => st.calls.filter((x) => x.cmd === c);
+    // A 4 x 4 px RGBA image for every gl://img fetch.
+    st.fetch = () => Promise.resolve({
+      status: 200,
+      headers: { get: (k) => (k === "X-Gl-W" || k === "X-Gl-H" ? "4" : "1") },
+      arrayBuffer: async () => new ArrayBuffer(64),
+    });
     return st;
   }
 
-  async function withMeasure(fn) {
-    const fake = makeFake();
+  async function withMeasure(fn, state) {
+    const fake = makeFake(state);
     window.__MF = fake;
     const iframe = document.createElement("iframe");
     iframe.style.cssText = "border:0;display:block;width:412px;height:800px";
     stage.appendChild(iframe);
     const base = new URL("../", location.href).href;
-    const html = measureHtml().replace("<head>", '<head><base href="' + base + '"><script>window.__TAURI__=parent.__MF.tauri;<\/script>');
+    const html = measureHtml().replace("<head>", '<head><base href="' + base + '"><script>window.__TAURI__=parent.__MF.tauri;window.fetch=parent.__MF.fetch;window.requestAnimationFrame=function(f){return setTimeout(f,0);};/* frames do not fire in the off-screen iframe */<\/script>');
     const d = iframe.contentDocument;
     d.open();
     d.write(html);
@@ -129,6 +141,38 @@
       ok(m.$("err").hidden, "no error line");
       ok(m.$("log").textContent.indexOf("Cancelled") >= 0, "log says Cancelled");
     }));
+
+    // ---------------------------------------------------------------- DS2.6
+    await test("DS2.6 #4: Cancel during the whole-file walk ends the run with cancelled:true (the walk's own cancel is not swallowed)", () => withMeasure(async (m) => {
+      m.$("walk").checked = true;
+      m.$("run").click();
+      await sleep(80);
+      eq(m.fake.cmds("measure_start").length, 1, "run started");
+      const img = (kind, id) => ({ doc: 7, page: 0, kind: kind, id: id, list_ms: 1, total_ms: 2, pt_w: 600, pt_h: 800 });
+      m.fake.emit("gl-image", img("lowres", 1));
+      m.fake.emit("gl-image", img("fit", 2));
+      await sleep(250); // first view done, plan answered, the walk has asked for page 1 and waits for its image
+      eq(m.fake.cmds("show_page").length, 1, "the walk is waiting for page 1");
+      ok(m.fake.cmds("measure_end").length === 0, "the run is still going");
+      m.$("cancel").click();
+      await sleep(250);
+      const steps = m.fake.cmds("measure_step").map((c) => JSON.parse(c.args.step));
+      const walk = steps.filter((s) => s.step === "walk");
+      eq(walk.length, 1, "the walk step is written");
+      eq(walk[0].cancelled, true, "and says cancelled");
+      const ends = m.fake.cmds("measure_end");
+      eq(ends.length, 1, "measure_end called once");
+      eq(ends[0].args.cancelled, true, "the run is marked cancelled");
+    }));
+
+    await test("DS2.6 #5: a failed results recovery is shown as one fixed sentence with the code", () => withMeasure(async (m) => {
+      ok(!m.$("recovered").hidden, "the note is shown");
+      eq(m.$("recovered").textContent, "Could not check the saved results for an unfinished run (E_RECOVER_FAILED).");
+    }, { recover_error: "E_RECOVER_FAILED" }));
+
+    await test("DS2.6 #5: no recover_error (or an empty one) shows nothing", () => withMeasure(async (m) => {
+      ok(m.$("recovered").hidden, "no note");
+    }, { recover_error: "" }));
   }
 
   run().then(() => {

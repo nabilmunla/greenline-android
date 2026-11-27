@@ -74,7 +74,7 @@
     lastProgress: 0,    // performance.now() of the last gl-progress for this doc
     progressMs: 0,      // its elapsed_ms
     stopped: false,     // the user cancelled: no new tile requests until the view changes
-    stats: { first: null, tiles: 0, last: null, handoffs: [], gestureFetches: 0 },
+    stats: { first: null, tiles: 0, last: null, handoffs: [] },
   };
 
   // ---------------------------------------------------------------------------------------------
@@ -317,7 +317,6 @@
     const cur = S.sharp;
     if (cur && cur.page === S.page && Math.abs(cur.z - r.z) < 1e-6 &&
         r.x0 >= cur.x0 && r.y0 >= cur.y0 && r.x0 + r.w <= cur.x0 + cur.w && r.y0 + r.h <= cur.y0 + cur.h) return;
-    if (gest) S.stats.gestureFetches++; // must stay 0
     const ctrl = new AbortController();
     const gen = ++regionGen, doc = S.doc, page = S.page;
     ctrl.glGen = gen;
@@ -373,7 +372,6 @@
   }
 
   async function fetchTile(t) {
-    if (gest) S.stats.gestureFetches++; // must stay 0: no requests while a finger is down
     const ctrl = new AbortController();
     const gen = S.gen, doc = S.doc;
     inflight.set(t.key, { ctrl, gen });
@@ -439,7 +437,6 @@
       s += "\nsharp #" + st.tiles + ": render " + f(l.renderMs) + " ms, engine wait " + f(l.waitMs) +
         " ms, handoff " + f(l.handoff) + " ms, total " + f(l.total) + " ms";
     }
-    s += "\nrequests during gestures " + st.gestureFetches;
     if (S.memNote) s += "\n" + S.memNote;
     $("stats").textContent = s;
   }
@@ -630,9 +627,11 @@
     showChrome(true);
     redraw();
     showStats();
+    let sent = false; // the host answers false when the engine thread is gone
     try {
-      await invoke("show_page", { page, fitWidth: FIT_WIDTH });
-    } catch (_) {
+      sent = (await invoke("show_page", { page, fitWidth: FIT_WIDTH })) !== false;
+    } catch (_) { /* not sent */ }
+    if (!sent) {
       S.waiting = false;
       showMsg("Engine not available", true);
     }
@@ -831,13 +830,15 @@
     $("viewer").hidden = !show;
     if (show) {
       applyDirection();
+      const wasZoomed = zoomed(); // judged at the old size, before the canvas takes the new one
       sizeCanvas();
-      if (hasPage()) S.view = clampV(S.view);
+      if (hasPage()) S.view = wasZoomed ? clampV(S.view) : fitView();
       showChrome(true);
       redraw();
       if (!backArmed) { history.pushState({ glViewer: 1 }, ""); backArmed = true; }
     } else {
       abortAll();
+      stopAnim();
       resetTouch();
       if (backArmed) { backArmed = false; history.back(); }
       exited();
@@ -854,6 +855,7 @@
       backArmed = true;
     } else {
       abortAll();
+      stopAnim();
       resetTouch();
       $("viewer").hidden = true;
       exited();
@@ -911,7 +913,7 @@
       S.recentId = r.recent_id || null;
       S.incoming = !!r.incoming;
       thumbSaved = false;
-      S.stats = { first: null, tiles: 0, last: null, handoffs: [], gestureFetches: 0 };
+      S.stats = { first: null, tiles: 0, last: null, handoffs: [] };
       showOpen(r, "OK");
       enterViewer(true);
       const p = Number.isInteger(startPage) ? Math.min(Math.max(startPage, 0), r.pages - 1) : 0;

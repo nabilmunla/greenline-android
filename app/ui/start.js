@@ -23,7 +23,7 @@
   let recents = [];
   let refreshSeq = 0;
   let dismissedMem = false;
-  let incomingBusy = false;
+  let incomingCheck = null;  // the running incoming check (a promise: true if it opened a file), or null
   let sheetOpen = null; // which sheet is open: "about", "settings" or null (only one at a time)
   let sheetPushed = false;
   let menuAnchor = null;
@@ -162,7 +162,11 @@
     try {
       const v = viewer();
       if (!v || typeof v.open !== "function") return;
+      const check = incomingCheck;
       r = await v.open(source, startPage);
+      // null: the viewer was busy. If that was the incoming check, wait for it and try once more, unless
+      // it opened a file (that file is now on screen).
+      if (!r && check && !(await check)) r = await v.open(source, startPage);
     } catch (_) {
       r = { error: "E_OPEN_FAILED" };
     }
@@ -177,18 +181,23 @@
   }
 
   // Something may be waiting from another app (Files, Gmail, Share). E_NONE is the normal answer.
-  async function checkIncoming() {
-    if (incomingBusy) return;
+  // Returns the check's promise (also while one is already running); it says whether a file was opened.
+  function checkIncoming() {
+    if (incomingCheck) return incomingCheck;
     const v = viewer();
-    if (!v || typeof v.open !== "function") return;
-    incomingBusy = true;
-    try {
-      handleResult(await v.open({ kind: "incoming" }), null);
-    } catch (_) {
-      /* nothing to show */
-    } finally {
-      incomingBusy = false;
-    }
+    if (!v || typeof v.open !== "function") return Promise.resolve(false);
+    const run = (async () => {
+      try {
+        const r = await v.open({ kind: "incoming" });
+        handleResult(r, null);
+        return !!r && !r.error;
+      } catch (_) {
+        return false; // nothing to show
+      }
+    })();
+    incomingCheck = run;
+    run.then(() => { if (incomingCheck === run) incomingCheck = null; });
+    return run;
   }
 
   function resume() {

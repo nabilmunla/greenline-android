@@ -269,6 +269,20 @@ fn planted_name_never_reaches_the_export() {
     assert!(!ok && text.contains("LEAKCHECK FAIL"), "{text}");
 }
 
+/// DS2.7: the app resets VmHWM after it writes the `run_start` line, so that line can hold the previous
+/// run's peak. The run's peak is the highest of its other lines.
+#[test]
+fn peak_leaves_the_run_start_line_out() {
+    let (run, l) = (11, Label::F05);
+    let mut rs = vec![Record { hwm_mb: Some(2000.0), ..Record::new(run, l, Kind::RunStart) }];
+    rs.push(Record { pages: Some(5), hwm_mb: Some(250.0), ..Record::step(run, l, Step::Open) });
+    rs.push(Record { lowres_ms: Some(1000.0), hwm_mb: Some(300.0), ..Record::step(run, l, Step::FirstView) });
+    rs.push(Record { cancelled: Some(false), hwm_mb: Some(280.0), ..Record::new(run, l, Kind::RunEnd) });
+    let s = &results::summarise(&rs)[0];
+    assert_eq!(s.peak_mb, Some(300.0), "the run_start line is not part of the peak");
+    assert_eq!(s.peak, results::Verdict::Pass, "300 MB is under the 1.5 GB mark");
+}
+
 /// The measure page and the app's measure code never log (no console, no println, no Android Log).
 #[test]
 fn measure_code_never_logs() {

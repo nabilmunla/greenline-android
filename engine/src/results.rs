@@ -920,7 +920,7 @@ record! {
         page_median_ms: Option<f64>,
         page_max_ms: Option<f64>,
         page: Verdict,
-        /// Highest VmHWM recorded in the run (main process).
+        /// Highest VmHWM recorded in the run's other lines (main process; not the run_start line).
         peak_mb: Option<f64>,
         peak: Verdict,
         /// Some step of the run was in direct mode.
@@ -971,7 +971,8 @@ pub fn summarise(records: &[Record]) -> Vec<Summary> {
         let page_max_ms = max_of(page_ms.iter().copied());
         let page_median_ms = median(page_ms);
         let page = if pages.is_some_and(|p| p <= 1) { Verdict::NotApplicable } else { mark(page_median_ms, PAGE_MAX_MS) };
-        let peak_mb = max_of(rs.iter().filter_map(|r| r.hwm_mb));
+        // Not the run_start line: the app writes it before it resets VmHWM, so it can hold the last run's peak.
+        let peak_mb = max_of(rs.iter().filter(|r| r.event != Kind::RunStart).filter_map(|r| r.hwm_mb));
         out.push(Summary {
             label,
             run,

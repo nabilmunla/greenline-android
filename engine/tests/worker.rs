@@ -518,6 +518,39 @@ fn tiny_region_origin_overflow_is_refused() {
     assert!(matches!(evs.last().unwrap().1, Event::Tile { id: 2, .. }), "{}", short(&evs.last().unwrap().1));
 }
 
+/// DS2.1 (sweep 0.1.11 #1): the sharp-view region floor starts again with each document. The viewer's
+/// region counter restarts at 0 after a reload, so a floor left from the previous document skipped
+/// every new region (TileSkipped) and the sharp view never came back.
+#[test]
+fn tiny_region_floor_starts_again_after_close_or_open() {
+    let _g = serial();
+    let e = Engine::start().expect("start");
+    let region = |id: u64, gen: u64| Request::Region { id, page: 0, zoom: 1.0, x0: 0, y0: 0, w: 64, h: 64, gen };
+    let answer = |e: &Engine| until(e, LONG, |ev| matches!(ev, Event::Tile { .. } | Event::TileSkipped { .. } | Event::Error { .. })).pop().unwrap().1;
+    open(&e, &tiny_pdf());
+    assert!(e.send(region(1, 5)));
+    assert!(matches!(answer(&e), Event::Tile { id: 1, .. }));
+    // Close, then open again: the first region of the new document (gen 1) is drawn.
+    assert!(e.send(Request::Close));
+    open(&e, &tiny_pdf());
+    assert!(e.send(region(2, 1)));
+    let a = answer(&e);
+    assert!(matches!(a, Event::Tile { id: 2, .. }), "after Close + Open: {}", short(&a));
+    // Open over an open document (no Close) also starts the floor again.
+    assert!(e.send(region(3, 7)));
+    assert!(matches!(answer(&e), Event::Tile { id: 3, .. }));
+    open(&e, &tiny_pdf());
+    assert!(e.send(region(4, 1)));
+    let a = answer(&e);
+    assert!(matches!(a, Event::Tile { id: 4, .. }), "after Open over Open: {}", short(&a));
+    // Within one document an older region is still skipped (DS.1 unchanged).
+    assert!(e.send(region(5, 3)));
+    assert!(matches!(answer(&e), Event::Tile { id: 5, .. }));
+    assert!(e.send(region(6, 2)));
+    let a = answer(&e);
+    assert!(matches!(a, Event::TileSkipped { id: 6, .. }), "older region in the same document: {}", short(&a));
+}
+
 /// DS.5 / bug sweep BUG-11: the engine draws at anti-aliasing level 4 (the approved setting), not
 /// MuPDF's default 8: its region equals a local render at AA 4 and differs from one at AA 8.
 #[test]
